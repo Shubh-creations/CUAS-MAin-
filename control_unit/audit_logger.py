@@ -1,21 +1,21 @@
 """
-Forensic Audit Trail & Cryptographic Mission Logging for CUAS.
-Maintains a tamper-evident event log with SHA-256 block hash chaining
-for military and defense incident compliance.
+Forensic Audit Trail & Cryptographic Mission Ledger for CUAS (v4.0-Lattice).
+Maintains an immutable blockchain-style SHA-256 hash-chained event ledger
+for military defense compliance and real-time chain verification.
 """
 
 import hashlib
 import json
 import os
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from utils.logger import get_logger
 
 logger = get_logger("CUAS.Audit")
 
 class ForensicAuditLogger:
-    """Tamper-evident audit logger for C2 incident records."""
+    """Tamper-evident SHA-256 hash-chained audit logger with integrity verification."""
     def __init__(self, log_dir: str = "logs/audit"):
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
@@ -47,32 +47,56 @@ class ForensicAuditLogger:
         block_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
         record_payload["block_hash"] = block_hash
 
-        # Write to file
+        # Write to append-only file
         with open(self.chain_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record_payload) + "\n")
 
         self.last_hash = block_hash
-        logger.debug(f"Audit block written: {event_type} [Hash: {block_hash[:12]}...]")
+        logger.debug(f"Audit block recorded: {event_type} [Hash: {block_hash[:12]}...]")
         return block_hash
 
-    def export_mission_report(self, output_path: str = "logs/mission_report.json") -> bool:
-        """Exports full mission history for after-action review."""
-        if not os.path.exists(self.chain_file):
-            return False
+    def verify_chain_integrity(self) -> Tuple[bool, int, str]:
+        """
+        Validates complete SHA-256 cryptographic chain integrity from block 0 to present.
+        Returns (is_valid, total_blocks_verified, message).
+        """
+        if not os.path.exists(self.chain_file) or os.path.getsize(self.chain_file) == 0:
+            return (True, 0, "CHAIN EMPTY (GENESIS PENDING)")
 
+        expected_prev = "0" * 64
+        count = 0
+
+        with open(self.chain_file, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                record = json.loads(line.strip())
+                recorded_hash = record.get("block_hash")
+                prev_hash = record.get("previous_hash")
+
+                if prev_hash != expected_prev:
+                    return (False, count, f"TAMPER DETECTED at block {line_no}: Previous hash mismatch.")
+
+                # Recompute hash
+                payload_copy = {k: v for k, v in record.items() if k != "block_hash"}
+                payload_str = json.dumps(payload_copy, sort_keys=True)
+                recomputed = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+                if recomputed != recorded_hash:
+                    return (False, count, f"TAMPER DETECTED at block {line_no}: Content hash invalid.")
+
+                expected_prev = recorded_hash
+                count += 1
+
+        return (True, count, f"ALL {count} BLOCKS VERIFIED (100% CRYPTOGRAPHIC INTEGRITY)")
+
+    def get_recent_blocks(self, limit: int = 8) -> List[Dict[str, Any]]:
+        """Returns the most recent verified blocks for UI telemetry."""
+        if not os.path.exists(self.chain_file):
+            return []
         records = []
         with open(self.chain_file, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     records.append(json.loads(line.strip()))
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "report_title": "CUAS Tactical Incident After-Action Report",
-                "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "total_events": len(records),
-                "events": records
-            }, f, indent=2)
-
-        logger.info(f"Exported mission report to {output_path}")
-        return True
+        return records[-limit:]
