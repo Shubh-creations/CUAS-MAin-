@@ -315,12 +315,12 @@ class SyntheticDroneGenerator:
         self.w = width
         self.h = height
         self.scenario = scenario
-        self.display_mode = "EO_DAYLIGHT"  # "EO_DAYLIGHT", "FLIR_WHITE_HOT", "FLIR_BLACK_HOT"
+        self.display_mode = "EO_DAYLIGHT"  # "EO_DAYLIGHT", "FLIR_WHITE_HOT", "FLIR_BLACK_HOT", "SWIR_NIGHT_VISION"
         self.drones: List[SwarmDroneInstance] = []
         self._init_scenario()
 
     def set_display_mode(self, mode: str):
-        if mode in ["EO_DAYLIGHT", "FLIR_WHITE_HOT", "FLIR_BLACK_HOT"]:
+        if mode in ["EO_DAYLIGHT", "FLIR_WHITE_HOT", "FLIR_BLACK_HOT", "SWIR_NIGHT_VISION"]:
             self.display_mode = mode
 
     def set_scenario(self, scenario: str):
@@ -352,30 +352,21 @@ class SyntheticDroneGenerator:
                 drone_type="CIVILIAN_MULTIROTOR", has_payload=False, temperature_k=320.0, rotor_rpm=9500
             ))
         else:
-            # Default: Multi-Axis Swarm Saturation (4 simultaneous drones)
-            self.drones.append(SwarmDroneInstance(
-                id_num=101, x=180, y=130, z=260, vx=2.0, vy=2.5, vz=-16.0,
-                drone_type="SUICIDE_FPV", has_payload=True, temperature_k=395.0, rotor_rpm=24000
-            ))
-            self.drones.append(SwarmDroneInstance(
-                id_num=102, x=460, y=120, z=290, vx=-2.2, vy=2.2, vz=-15.0,
-                drone_type="SUICIDE_FPV", has_payload=True, temperature_k=390.0, rotor_rpm=23500
-            ))
-            self.drones.append(SwarmDroneInstance(
-                id_num=103, x=330, y=80, z=380, vx=0.6, vy=1.2, vz=-6.0,
-                drone_type="RECON_QUAD", has_payload=False, temperature_k=345.0, rotor_rpm=14000
-            ))
-            self.drones.append(SwarmDroneInstance(
-                id_num=104, x=510, y=240, z=90, vx=-1.0, vy=0.2, vz=0.0,
-                drone_type="CIVILIAN_MULTIROTOR", has_payload=False, temperature_k=315.0, rotor_rpm=8800
-            ))
+            # Multi-Axis Swarm Saturation (8 simultaneous drones)
+            self.drones.append(SwarmDroneInstance(101, 180, 130, 260, 2.0, 2.5, -16.0, "SUICIDE_FPV", True, 395.0, 24000))
+            self.drones.append(SwarmDroneInstance(102, 460, 120, 290, -2.2, 2.2, -15.0, "SUICIDE_FPV", True, 390.0, 23500))
+            self.drones.append(SwarmDroneInstance(103, 330, 80, 380, 0.6, 1.2, -6.0, "RECON_QUAD", False, 345.0, 14000))
+            self.drones.append(SwarmDroneInstance(104, 510, 240, 90, -1.0, 0.2, 0.0, "CIVILIAN_MULTIROTOR", False, 315.0, 8800))
+            self.drones.append(SwarmDroneInstance(105, 120, 180, 210, 1.8, 1.9, -12.0, "SUICIDE_FPV", True, 385.0, 22000))
+            self.drones.append(SwarmDroneInstance(106, 520, 160, 320, -1.6, 1.5, -9.0, "DECOY", False, 350.0, 15000))
+            self.drones.append(SwarmDroneInstance(107, 280, 60, 420, 0.4, 0.8, -4.0, "RECON_QUAD", False, 330.0, 12000))
+            self.drones.append(SwarmDroneInstance(108, 390, 210, 140, -0.8, 2.8, -18.0, "SUICIDE_FPV", True, 398.0, 24500))
 
     def generate_frame(self) -> np.ndarray:
         frame = np.zeros((self.h, self.w, 3), dtype=np.uint8)
 
         # 1. Background Generation (Sky + Horizon + Terrain)
         if self.display_mode == "EO_DAYLIGHT":
-            # Realistic Daylight: atmospheric gradient from deep aerospace blue to light haze
             for y in range(self.h):
                 if y < int(self.h * 0.72):
                     ratio = y / (self.h * 0.72)
@@ -384,16 +375,18 @@ class SyntheticDroneGenerator:
                     r = int(25 + ratio * 25)
                     frame[y, :] = (b, g, r)
                 else:
-                    # Rolling terrain / horizon
                     t_ratio = (y - self.h * 0.72) / (self.h * 0.28)
                     frame[y, :] = (int(18 + t_ratio * 12), int(28 + t_ratio * 16), int(14 + t_ratio * 10))
         elif self.display_mode == "FLIR_WHITE_HOT":
-            # FLIR White-Hot: Cool background is dark gray/black; hot targets glow white
             for y in range(self.h):
                 val = int(18 + (y / self.h) * 22)
                 frame[y, :] = (val, val, val)
+        elif self.display_mode == "SWIR_NIGHT_VISION":
+            # Phosphor Emerald Night Vision
+            for y in range(self.h):
+                g = int(28 + (y / self.h) * 45)
+                frame[y, :] = (int(g * 0.2), g, int(g * 0.3))
         else: # FLIR_BLACK_HOT
-            # FLIR Black-Hot: Cool background is light gray; hot targets glow deep black
             for y in range(self.h):
                 val = int(210 - (y / self.h) * 25)
                 frame[y, :] = (val, val, val)
