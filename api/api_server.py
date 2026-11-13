@@ -1,1048 +1,2020 @@
 """
-FastAPI REST & WebSocket Command and Control (C2) Server with Full-Bleed Spatial Battlespace OS (v4.0-Lattice).
-Provides a 100vw x 100vh Full-Bleed Spatial Battlespace Operating System (Anduril Lattice OS Architecture)
-with hardware-accelerated 2.5D/3D Isometric projection, chamfered glassmorphic HUD overlays,
-8-drone multi-target swarm intelligence, multi-spectral EO/IR FLIR shaders, and optimal Weapon-Target Assignment (WTA).
+CUAS v5.0-LatticeOS — Full-Bleed 3D Spatial Air Defense & Counter-Swarm C2 Server
+Drop-in replacement for C:\\CUAS\\api\\api_server.py
 """
 
-from typing import Dict, List, Optional, Any
-import time
+from __future__ import annotations
+
 import asyncio
+import hashlib
 import json
 import math
+import random
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 
-from utils.logger import get_logger
-from control_unit.threat_manager import ThreatManager
-from control_unit.neutralization import CountermeasureController, CountermeasureType
-from control_unit.audit_logger import ForensicAuditLogger
-from sensors.rf_sensor import RFSensorSimulator
-from sensors.radar_sensor import RadarSensorSimulator
+# ============================================================================
+# 1. CRYPTOGRAPHIC SHA-256 FORENSIC AUDIT LEDGER
+# ============================================================================
 
-logger = get_logger("CUAS.API")
+AUDIT_LOG_PATH = Path("logs/audit/mission_audit_chain.jsonl")
+
+
+class LatticeAuditLedger:
+    """Tamper-evident SHA-256 hash-chained mission logger."""
+
+    def __init__(self, log_path: Path = AUDIT_LOG_PATH) -> None:
+        self.log_path = log_path
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.chain: List[Dict[str, Any]] = []
+        self._load_or_init()
+
+    def _load_or_init(self) -> None:
+        if self.log_path.exists():
+            try:
+                with open(self.log_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            self.chain.append(json.loads(line))
+            except Exception:
+                self.chain = []
+        if not self.chain:
+            self.record_event(
+                event_type="LATTICE_OS_BOOT",
+                operator="AUTONOMOUS_CORE",
+                payload={"version": "5.0.0-LatticeOS", "posture": "ACTIVE_DEFENSE"},
+            )
+
+    def record_event(
+        self, event_type: str, operator: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        prev_hash = self.chain[-1]["block_hash"] if self.chain else "0" * 64
+        payload_str = json.dumps(payload, sort_keys=True)
+        raw = f"{timestamp}|{event_type}|{operator}|{payload_str}|{prev_hash}"
+        block_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+        block = {
+            "index": len(self.chain),
+            "timestamp": timestamp,
+            "event_type": event_type,
+            "operator": operator,
+            "payload": payload,
+            "prev_hash": prev_hash,
+            "block_hash": block_hash,
+        }
+        self.chain.append(block)
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(block) + "\n")
+        except Exception:
+            pass
+        return block
+
+    def verify_integrity(self) -> Dict[str, Any]:
+        for idx, block in enumerate(self.chain):
+            expected_prev = "0" * 64 if idx == 0 else self.chain[idx - 1]["block_hash"]
+            if block.get("prev_hash") != expected_prev:
+                return {"verified": False, "corrupted_block": idx}
+        return {
+            "verified": True,
+            "total_blocks": len(self.chain),
+            "head_hash": self.chain[-1]["block_hash"] if self.chain else "0" * 64,
+        }
+
+
+# ============================================================================
+# 2. 3D IMM-UKF MULTI-TARGET SWARM & CLOSED-LOOP EFFECTOR ENGINE
+# ============================================================================
+
+BASE_LAT = 37.7749
+BASE_LON = -122.4194
+
+
+def enu_to_geodetic(east_m: float, north_m: float) -> tuple[float, float]:
+    d_lat = (north_m / 6378137.0) * (180.0 / math.pi)
+    d_lon = (
+        (east_m / (6378137.0 * math.cos(math.radians(BASE_LAT))))
+        * (180.0 / math.pi)
+    )
+    return round(BASE_LAT + d_lat, 6), round(BASE_LON + d_lon, 6)
+
+
+@dataclass
+class TacticalTrack:
+    target_id: str
+    affiliation: str  # HOSTILE, SUSPECT, FRIENDLY, NEUTRAL
+    drone_class: str
+    rf_protocol: str
+    east_m: float
+    north_m: float
+    alt_m: float
+    vx_ms: float
+    vy_ms: float
+    vz_ms: float
+    ax_ms2: float = 0.0
+    ay_ms2: float = 0.0
+    az_ms2: float = 0.0
+    rcs_dbsm: float = -15.4
+    rotor_rpm: float = 13800.0
+    payload_detected: bool = True
+    confidence: float = 0.958
+    active_effectors: List[str] = field(default_factory=list)
+    status: str = "ACTIVE"  # ACTIVE, JAMMED, SPOOFED, DAZZLED, INTERCEPTING
+    kill_chain_stage: str = "IDENTIFY"
+    trail: List[List[float]] = field(default_factory=list)
+    intercept_target_id: Optional[str] = None
+
+    def compute_metrics(self) -> Dict[str, Any]:
+        range_2d = math.hypot(self.east_m, self.north_m)
+        slant_range = math.sqrt(range_2d**2 + self.alt_m**2)
+        bearing_deg = (math.degrees(math.atan2(self.east_m, self.north_m)) + 360.0) % 360.0
+        speed_ms = math.sqrt(self.vx_ms**2 + self.vy_ms**2 + self.vz_ms**2)
+
+        if slant_range > 1.0:
+            closing_vel = -(
+                self.east_m * self.vx_ms
+                + self.north_m * self.vy_ms
+                + self.alt_m * self.vz_ms
+            ) / slant_range
+        else:
+            closing_vel = 0.0
+
+        tti_s = round(slant_range / max(closing_vel, 0.5), 1) if closing_vel > 0.8 else 999.0
+
+        if range_2d < 500.0:
+            zone = "RED (KILLZONE <500m)"
+            zone_code = "RED"
+        elif range_2d < 1500.0:
+            zone = "AMBER (WARNING <1500m)"
+            zone_code = "AMBER"
+        else:
+            zone = "GREEN (DETECTION <3500m)"
+            zone_code = "GREEN"
+
+        # 3-Mode IMM Kinematic Probabilities
+        accel_mag = math.hypot(self.ax_ms2, self.ay_ms2)
+        dive_factor = max(0.0, -self.vz_ms / 14.0) + (0.95 if range_2d < 750 and closing_vel > 20 else 0.1)
+        evasive_factor = min(1.0, accel_mag / 9.5)
+        loiter_factor = max(0.08, 1.0 - max(dive_factor, evasive_factor) * 0.78)
+        norm = loiter_factor + evasive_factor + dive_factor + 1e-6
+        imm_modes = {
+            "loiter": round(loiter_factor / norm, 2),
+            "evasive": round(evasive_factor / norm, 2),
+            "terminal_dive": round(dive_factor / norm, 2),
+        }
+
+        class_weights = {
+            "SUICIDE_DRONE": 1.0,
+            "AUTONOMOUS_LOITERING_MUNITION": 1.0,
+            "CUSTOMIZED_DRONE": 0.85,
+            "SURVEILLANCE_DRONE": 0.60,
+            "UNKNOWN_AIR_VEHICLE": 0.50,
+            "CIVILIAN_MULTIROTOR": 0.20,
+            "KINETIC_INTERCEPTOR": 0.0,
+        }
+        base_w = class_weights.get(self.drone_class, 0.55)
+        prox_bonus = max(0.0, (2800.0 - min(range_2d, 2800.0)) / 2800.0) * 28.0
+        payload_bonus = 12.0 if self.payload_detected else 0.0
+        stealth_bonus = 10.0 if self.rf_protocol == "RF_SILENT_AUTONOMOUS" else 0.0
+
+        if self.affiliation == "FRIENDLY":
+            threat_score = 0.0
+        elif self.status in ("JAMMED", "SPOOFED", "DAZZLED"):
+            threat_score = round(min(100.0, (base_w * self.confidence * 38.0) + prox_bonus * 0.35), 1)
+        else:
+            threat_score = round(
+                min(100.0, (base_w * self.confidence * 62.0) + prox_bonus + payload_bonus + stealth_bonus),
+                1,
+            )
+
+        # Explainable sub-scores (0-100)
+        sub_scores = {
+            "kinematic_lethality": round(min(100.0, max(10.0, closing_vel * 2.8 + imm_modes["terminal_dive"] * 35.0)), 1),
+            "payload_hazard": 94.0 if self.payload_detected else 14.0,
+            "rf_stealth_anomaly": 98.0 if self.rf_protocol == "RF_SILENT_AUTONOMOUS" else 32.0,
+            "swarm_coordination": 88.0 if self.affiliation == "HOSTILE" else 22.0,
+        }
+
+        # 3D Predicted Trajectory Ribbon [east, north, alt]
+        predicted_path = []
+        px, py, pz = self.east_m, self.north_m, self.alt_m
+        vx, vy, vz = self.vx_ms, self.vy_ms, self.vz_ms
+        for _ in range(22):
+            dt = 0.4
+            px += vx * dt + 0.5 * self.ax_ms2 * (dt**2)
+            py += vy * dt + 0.5 * self.ay_ms2 * (dt**2)
+            pz = max(0.0, pz + vz * dt)
+            predicted_path.append([round(px, 1), round(py, 1), round(pz, 1)])
+
+        # Kill-chain stage index (1 to 6)
+        stage_map = {
+            "DETECT": 1,
+            "TRACK": 2,
+            "IDENTIFY": 3,
+            "CUE_WTA": 4,
+            "ENGAGE": 5,
+            "BDA_SPLASH": 6,
+        }
+        stage_num = 5 if self.active_effectors else stage_map.get(self.kill_chain_stage, 3)
+        if range_2d < 900.0 and not self.active_effectors and self.affiliation == "HOSTILE":
+            stage_num = 4
+            self.kill_chain_stage = "CUE_WTA"
+
+        if self.affiliation == "FRIENDLY":
+            wta_rec = "BLUE-FORCE HARD-KILL INTERCEPT"
+            p_success = 0.99
+        elif self.rf_protocol == "RF_SILENT_AUTONOMOUS" or range_2d < 520.0:
+            wta_rec = "KINETIC INTERCEPTOR + SWIR DAZZLER"
+            p_success = 0.95
+        elif range_2d < 1250.0:
+            wta_rec = "DIRECTIONAL RF JAMMER + GNSS SPOOFER"
+            p_success = 0.91
+        else:
+            wta_rec = "CUE DIRECTIONAL RF JAMMER"
+            p_success = 0.86
+
+        cardinals = [
+            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+        ]
+        cardinal = cardinals[int(((bearing_deg + 11.25) % 360) / 22.5)]
+        lat, lon = enu_to_geodetic(self.east_m, self.north_m)
+
+        rssi_dbm = (
+            -110.0
+            if self.rf_protocol == "RF_SILENT_AUTONOMOUS"
+            else round(-36.0 - 20.0 * math.log10(max(slant_range, 10.0)), 1)
+        )
+
+        return {
+            "target_id": self.target_id,
+            "affiliation": self.affiliation,
+            "drone_class": self.drone_class,
+            "rf_protocol": self.rf_protocol,
+            "east_m": round(self.east_m, 1),
+            "north_m": round(self.north_m, 1),
+            "alt_m": round(self.alt_m, 1),
+            "lat": lat,
+            "lon": lon,
+            "range_m": round(range_2d, 1),
+            "slant_range_m": round(slant_range, 1),
+            "bearing_deg": round(bearing_deg, 1),
+            "bearing_cardinal": cardinal,
+            "speed_ms": round(speed_ms, 1),
+            "closing_vel_ms": round(closing_vel, 1),
+            "vz_ms": round(self.vz_ms, 1),
+            "tti_s": tti_s,
+            "zone": zone,
+            "zone_code": zone_code,
+            "confidence": round(self.confidence * 100.0, 1),
+            "threat_score": threat_score,
+            "sub_scores": sub_scores,
+            "rcs_dbsm": self.rcs_dbsm,
+            "rotor_rpm": round(self.rotor_rpm, 0),
+            "rssi_dbm": rssi_dbm,
+            "payload_detected": self.payload_detected,
+            "imm_modes": imm_modes,
+            "status": self.status,
+            "kill_chain_stage": self.kill_chain_stage,
+            "kill_chain_num": stage_num,
+            "active_effectors": self.active_effectors,
+            "wta_recommendation": wta_rec,
+            "p_success": round(p_success * 100.0, 1),
+            "corroboration": (
+                ["EO", "RAD"]
+                if self.rf_protocol == "RF_SILENT_AUTONOMOUS"
+                else ["EO", "RAD", "RF"]
+            ),
+            "trail": self.trail[-28:],
+            "predicted_path": predicted_path,
+        }
+
+
+class TacticalBattlespaceEngine:
+    """Multi-Sensor 3D Swarm Kinematics & Closed-Loop Countermeasure Engine."""
+
+    def __init__(self, audit_ledger: LatticeAuditLedger) -> None:
+        self.audit = audit_ledger
+        self.scenario = "SWARM_SATURATION"
+        self.roe_mode = "MANUAL_HITL"
+        self.boot_time = time.time()
+        self.last_tick = time.time()
+        self.radar_sweep_deg = 0.0
+        self.neutralized_count = 0
+        self.selected_target_id = "#101-ALPHA"
+        self.tracks: Dict[str, TacticalTrack] = {}
+        self.splash_events: List[Dict[str, Any]] = []
+        self.effectors: Dict[str, Dict[str, Any]] = {
+            "RF_JAMMER": {
+                "id": "RF_JAMMER",
+                "name": "DIRECTIONAL RF JAMMER",
+                "band": "2.4 / 5.8 GHz",
+                "state": "STANDBY",
+                "target_id": None,
+                "azimuth_deg": 48.0,
+                "power_kw": 2.8,
+            },
+            "GNSS_SPOOFER": {
+                "id": "GNSS_SPOOFER",
+                "name": "GNSS / GPS SPOOFER",
+                "band": "L1 / L5 EPHEMERIS",
+                "state": "STANDBY",
+                "target_id": None,
+                "azimuth_deg": 0.0,
+                "power_kw": 1.4,
+            },
+            "OPTICAL_DAZZLER": {
+                "id": "OPTICAL_DAZZLER",
+                "name": "SWIR OPTICAL DAZZLER",
+                "band": "1064nm DIRECTED",
+                "state": "STANDBY",
+                "target_id": None,
+                "azimuth_deg": 48.0,
+                "power_kw": 0.95,
+            },
+            "KINETIC_INTERCEPTOR": {
+                "id": "KINETIC_INTERCEPTOR",
+                "name": "KINETIC INTERCEPTOR",
+                "band": "HARD-KILL SILO",
+                "state": "READY (6 SILOS)",
+                "target_id": None,
+                "ammo_remaining": 6,
+            },
+        }
+        self.load_scenario(self.scenario)
+
+    def load_scenario(self, scenario_name: str) -> None:
+        self.scenario = scenario_name.upper()
+        self.tracks.clear()
+        self.splash_events.clear()
+        for eff in self.effectors.values():
+            if eff["id"] == "KINETIC_INTERCEPTOR":
+                eff["state"] = "READY (6 SILOS)"
+                eff["ammo_remaining"] = 6
+            else:
+                eff["state"] = "STANDBY"
+            eff["target_id"] = None
+
+        if self.scenario == "FPV_TERMINAL_DIVE":
+            self._spawn_dive_scenario()
+        elif self.scenario == "RF_SILENT_STEALTH":
+            self._spawn_stealth_scenario()
+        elif self.scenario == "MIXED_AIRSPACE":
+            self._spawn_mixed_scenario()
+        else:
+            self.scenario = "SWARM_SATURATION"
+            self._spawn_swarm_scenario()
+
+        self.audit.record_event(
+            "SCENARIO_INITIALIZED",
+            "LATTICE_SIM_CORE",
+            {"scenario": self.scenario, "tracks": len(self.tracks)},
+        )
+
+    def _spawn_swarm_scenario(self) -> None:
+        presets = [
+            TacticalTrack(
+                target_id="#101-ALPHA",
+                affiliation="HOSTILE",
+                drone_class="SUICIDE_DRONE",
+                rf_protocol="ExpressLRS 2.4GHz",
+                east_m=295.0,
+                north_m=285.0,
+                alt_m=145.0,
+                vx_ms=-19.0,
+                vy_ms=-21.5,
+                vz_ms=-4.4,
+                rcs_dbsm=-16.4,
+                rotor_rpm=14800,
+                payload_detected=True,
+                confidence=0.968,
+            ),
+            TacticalTrack(
+                target_id="#102-BRAVO",
+                affiliation="HOSTILE",
+                drone_class="AUTONOMOUS_LOITERING_MUNITION",
+                rf_protocol="RF_SILENT_AUTONOMOUS",
+                east_m=-620.0,
+                north_m=480.0,
+                alt_m=240.0,
+                vx_ms=24.5,
+                vy_ms=-18.0,
+                vz_ms=-3.8,
+                rcs_dbsm=-18.6,
+                rotor_rpm=15900,
+                payload_detected=True,
+                confidence=0.944,
+            ),
+            TacticalTrack(
+                target_id="#103-CHARLIE",
+                affiliation="HOSTILE",
+                drone_class="CUSTOMIZED_DRONE",
+                rf_protocol="DJI OcuSync-3",
+                east_m=860.0,
+                north_m=-490.0,
+                alt_m=190.0,
+                vx_ms=-22.0,
+                vy_ms=13.5,
+                vz_ms=-1.8,
+                rcs_dbsm=-13.2,
+                rotor_rpm=10400,
+                payload_detected=True,
+                confidence=0.921,
+            ),
+            TacticalTrack(
+                target_id="#104-DELTA",
+                affiliation="SUSPECT",
+                drone_class="SURVEILLANCE_DRONE",
+                rf_protocol="MAVLink 915MHz",
+                east_m=-1120.0,
+                north_m=-780.0,
+                alt_m=360.0,
+                vx_ms=14.0,
+                vy_ms=11.0,
+                vz_ms=0.0,
+                rcs_dbsm=-11.8,
+                rotor_rpm=7800,
+                payload_detected=False,
+                confidence=0.895,
+            ),
+            TacticalTrack(
+                target_id="#105-ECHO",
+                affiliation="HOSTILE",
+                drone_class="SUICIDE_DRONE",
+                rf_protocol="TBS Crossfire",
+                east_m=120.0,
+                north_m=-1180.0,
+                alt_m=110.0,
+                vx_ms=-3.5,
+                vy_ms=29.0,
+                vz_ms=-2.1,
+                rcs_dbsm=-15.9,
+                rotor_rpm=14200,
+                payload_detected=True,
+                confidence=0.952,
+            ),
+            TacticalTrack(
+                target_id="#106-FOXTROT",
+                affiliation="HOSTILE",
+                drone_class="CUSTOMIZED_DRONE",
+                rf_protocol="Lightbridge",
+                east_m=-340.0,
+                north_m=1290.0,
+                alt_m=285.0,
+                vx_ms=8.5,
+                vy_ms=-26.0,
+                vz_ms=-3.2,
+                rcs_dbsm=-14.1,
+                rotor_rpm=11600,
+                payload_detected=True,
+                confidence=0.918,
+            ),
+        ]
+        for t in presets:
+            self.tracks[t.target_id] = t
+        self.selected_target_id = "#101-ALPHA"
+
+    def _spawn_dive_scenario(self) -> None:
+        self.tracks["#101-ALPHA"] = TacticalTrack(
+            target_id="#101-ALPHA",
+            affiliation="HOSTILE",
+            drone_class="SUICIDE_DRONE",
+            rf_protocol="ExpressLRS 2.4GHz",
+            east_m=310.0,
+            north_m=285.0,
+            alt_m=185.0,
+            vx_ms=-23.5,
+            vy_ms=-21.0,
+            vz_ms=-8.5,
+            ax_ms2=-3.8,
+            ay_ms2=-3.2,
+            rcs_dbsm=-16.8,
+            rotor_rpm=16200,
+            payload_detected=True,
+            confidence=0.948,
+        )
+        self.tracks["#102-BRAVO"] = TacticalTrack(
+            target_id="#102-BRAVO",
+            affiliation="HOSTILE",
+            drone_class="SUICIDE_DRONE",
+            rf_protocol="TBS Crossfire",
+            east_m=-520.0,
+            north_m=410.0,
+            alt_m=220.0,
+            vx_ms=21.0,
+            vy_ms=-17.5,
+            vz_ms=-6.2,
+            payload_detected=True,
+            confidence=0.934,
+        )
+        self.selected_target_id = "#101-ALPHA"
+
+    def _spawn_stealth_scenario(self) -> None:
+        for i, deg in enumerate([42, 160, 285], start=1):
+            rad = math.radians(deg)
+            dist = 820.0 + i * 190.0
+            tid = f"#20{i}-PHANTOM"
+            self.tracks[tid] = TacticalTrack(
+                target_id=tid,
+                affiliation="HOSTILE",
+                drone_class="AUTONOMOUS_LOITERING_MUNITION",
+                rf_protocol="RF_SILENT_AUTONOMOUS",
+                east_m=dist * math.sin(rad),
+                north_m=dist * math.cos(rad),
+                alt_m=95.0 + i * 35.0,
+                vx_ms=-28.0 * math.sin(rad),
+                vy_ms=-28.0 * math.cos(rad),
+                vz_ms=-2.8,
+                rcs_dbsm=-19.4,
+                rotor_rpm=15400,
+                payload_detected=True,
+                confidence=0.961,
+            )
+        self.selected_target_id = "#201-PHANTOM"
+
+    def _spawn_mixed_scenario(self) -> None:
+        self._spawn_swarm_scenario()
+        self.tracks["#CIV-901"] = TacticalTrack(
+            target_id="#CIV-901",
+            affiliation="NEUTRAL",
+            drone_class="CIVILIAN_MULTIROTOR",
+            rf_protocol="DJI OcuSync-3",
+            east_m=-1380.0,
+            north_m=980.0,
+            alt_m=125.0,
+            vx_ms=11.0,
+            vy_ms=3.5,
+            vz_ms=0.0,
+            rcs_dbsm=-9.2,
+            rotor_rpm=5600,
+            payload_detected=False,
+            confidence=0.988,
+            kill_chain_stage="TRACK",
+        )
+
+    def step(self) -> None:
+        now = time.time()
+        dt = min(max(now - self.last_tick, 0.01), 0.25)
+        self.last_tick = now
+        self.radar_sweep_deg = (self.radar_sweep_deg + 150.0 * dt) % 360.0
+
+        # Expire old splash shockwaves after 2.5 seconds
+        self.splash_events = [s for s in self.splash_events if now - s["time"] < 2.5]
+
+        to_remove: List[str] = []
+        interceptors = [t for t in self.tracks.values() if t.affiliation == "FRIENDLY"]
+
+        for icp in interceptors:
+            tgt = self.tracks.get(icp.intercept_target_id or "")
+            if not tgt:
+                to_remove.append(icp.target_id)
+                continue
+            dx = tgt.east_m - icp.east_m
+            dy = tgt.north_m - icp.north_m
+            dz = tgt.alt_m - icp.alt_m
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist < 48.0:
+                self.neutralized_count += 1
+                self.splash_events.append(
+                    {
+                        "east_m": round(tgt.east_m, 1),
+                        "north_m": round(tgt.north_m, 1),
+                        "alt_m": round(tgt.alt_m, 1),
+                        "target_id": tgt.target_id,
+                        "time": now,
+                    }
+                )
+                to_remove.append(icp.target_id)
+                to_remove.append(tgt.target_id)
+                self.audit.record_event(
+                    "BDA_KINETIC_SPLASH",
+                    "BLUE_FORCE_INTERCEPTOR",
+                    {
+                        "interceptor": icp.target_id,
+                        "neutralized_target": tgt.target_id,
+                        "slant_range_m": round(math.hypot(tgt.east_m, tgt.north_m), 1),
+                    },
+                )
+            else:
+                speed = 76.0
+                icp.vx_ms = (dx / dist) * speed
+                icp.vy_ms = (dy / dist) * speed
+                icp.vz_ms = (dz / dist) * speed
+                icp.east_m += icp.vx_ms * dt
+                icp.north_m += icp.vy_ms * dt
+                icp.alt_m += icp.vz_ms * dt
+                icp.trail.append([round(icp.east_m, 1), round(icp.north_m, 1), round(icp.alt_m, 1)])
+
+        for tid, trk in list(self.tracks.items()):
+            if trk.affiliation == "FRIENDLY" or tid in to_remove:
+                continue
+
+            if "RF_JAMMER" in trk.active_effectors and trk.rf_protocol != "RF_SILENT_AUTONOMOUS":
+                trk.status = "JAMMED"
+                trk.kill_chain_stage = "ENGAGE"
+                trk.vx_ms *= 0.91
+                trk.vy_ms *= 0.91
+                trk.vz_ms = -2.4
+            if "GNSS_SPOOFER" in trk.active_effectors:
+                trk.status = "SPOOFED"
+                trk.kill_chain_stage = "ENGAGE"
+                away = math.atan2(trk.east_m, trk.north_m)
+                trk.vx_ms = 22.0 * math.sin(away)
+                trk.vy_ms = 22.0 * math.cos(away)
+                trk.vz_ms = 0.8
+            if "OPTICAL_DAZZLER" in trk.active_effectors:
+                trk.status = "DAZZLED"
+                trk.kill_chain_stage = "ENGAGE"
+                trk.ax_ms2 = random.uniform(-11.0, 11.0)
+                trk.ay_ms2 = random.uniform(-11.0, 11.0)
+
+            rng = math.hypot(trk.east_m, trk.north_m)
+            if trk.status == "ACTIVE" and trk.affiliation == "HOSTILE":
+                weave = math.sin(now * 1.9 + hash(tid) % 10) * 3.4
+                trk.ax_ms2 = weave
+                trk.ay_ms2 = -weave
+                if rng < 90.0:
+                    ang = random.uniform(0, 2 * math.pi)
+                    trk.east_m = 1580.0 * math.sin(ang)
+                    trk.north_m = 1580.0 * math.cos(ang)
+                    trk.alt_m = random.uniform(130.0, 290.0)
+                    trk.vx_ms = -23.0 * math.sin(ang)
+                    trk.vy_ms = -23.0 * math.cos(ang)
+                    trk.trail.clear()
+
+            trk.east_m += trk.vx_ms * dt
+            trk.north_m += trk.vy_ms * dt
+            trk.alt_m = max(10.0, trk.alt_m + trk.vz_ms * dt)
+
+            if len(trk.trail) == 0 or math.hypot(
+                trk.east_m - trk.trail[-1][0], trk.north_m - trk.trail[-1][1]
+            ) > 15.0:
+                trk.trail.append([round(trk.east_m, 1), round(trk.north_m, 1), round(trk.alt_m, 1)])
+
+            if trk.status in ("JAMMED", "SPOOFED") and (rng > 2400.0 or trk.alt_m <= 11.0):
+                self.neutralized_count += 1
+                self.splash_events.append(
+                    {
+                        "east_m": round(trk.east_m, 1),
+                        "north_m": round(trk.north_m, 1),
+                        "alt_m": round(trk.alt_m, 1),
+                        "target_id": trk.target_id,
+                        "time": now,
+                    }
+                )
+                to_remove.append(tid)
+
+        for tid in set(to_remove):
+            self.tracks.pop(tid, None)
+
+        if not [t for t in self.tracks.values() if t.affiliation != "FRIENDLY"]:
+            self.load_scenario(self.scenario)
+
+        if self.roe_mode == "AUTO_ENGAGE":
+            for trk in list(self.tracks.values()):
+                if trk.affiliation == "HOSTILE" and trk.status == "ACTIVE":
+                    rng = math.hypot(trk.east_m, trk.north_m)
+                    if rng < 850.0 and not trk.active_effectors:
+                        if trk.rf_protocol == "RF_SILENT_AUTONOMOUS":
+                            self.engage_countermeasure("OPTICAL_DAZZLER", trk.target_id, "AUTO_WTA_ROE")
+                        else:
+                            self.engage_countermeasure("RF_JAMMER", trk.target_id, "AUTO_WTA_ROE")
+
+    def engage_countermeasure(
+        self, effector_type: str, target_id: Optional[str] = None, operator: str = "LATTICE_OPERATOR"
+    ) -> Dict[str, Any]:
+        eff_key = effector_type.upper()
+        if eff_key in ("DISENGAGE_ALL", "EMERGENCY_DISENGAGE", "CEASEFIRE"):
+            return self.disengage_all(operator)
+
+        alias_map = {
+            "JAMMER": "RF_JAMMER",
+            "RF_JAMMER": "RF_JAMMER",
+            "SPOOFER": "GNSS_SPOOFER",
+            "GNSS_SPOOFER": "GNSS_SPOOFER",
+            "GPS_SPOOFER": "GNSS_SPOOFER",
+            "DAZZLER": "OPTICAL_DAZZLER",
+            "OPTICAL_DAZZLER": "OPTICAL_DAZZLER",
+            "INTERCEPTOR": "KINETIC_INTERCEPTOR",
+            "KINETIC_INTERCEPTOR": "KINETIC_INTERCEPTOR",
+        }
+        canonical = alias_map.get(eff_key, "RF_JAMMER")
+        tgt_id = target_id or self.selected_target_id
+        if tgt_id not in self.tracks and self.tracks:
+            tgt_id = next(iter(self.tracks.keys()))
+        trk = self.tracks.get(tgt_id)
+
+        if not trk:
+            return {"status": "NO_ACTIVE_TARGET", "effector": canonical}
+
+        bearing = (math.degrees(math.atan2(trk.east_m, trk.north_m)) + 360.0) % 360.0
+
+        if canonical == "KINETIC_INTERCEPTOR":
+            ammo = self.effectors["KINETIC_INTERCEPTOR"].get("ammo_remaining", 6)
+            if ammo > 0:
+                self.effectors["KINETIC_INTERCEPTOR"]["ammo_remaining"] = ammo - 1
+            icp_id = f"#ICP-{random.randint(10, 99)}"
+            self.tracks[icp_id] = TacticalTrack(
+                target_id=icp_id,
+                affiliation="FRIENDLY",
+                drone_class="KINETIC_INTERCEPTOR",
+                rf_protocol="LINK-16_TACTICAL",
+                east_m=0.0,
+                north_m=0.0,
+                alt_m=22.0,
+                vx_ms=0.0,
+                vy_ms=0.0,
+                vz_ms=18.0,
+                confidence=1.0,
+                status="INTERCEPTING",
+                kill_chain_stage="ENGAGE",
+                intercept_target_id=trk.target_id,
+            )
+            self.effectors[canonical]["state"] = f"LAUNCHED -> {trk.target_id}"
+            self.effectors[canonical]["target_id"] = trk.target_id
+        else:
+            if canonical not in trk.active_effectors:
+                trk.active_effectors.append(canonical)
+            self.effectors[canonical]["state"] = "ENGAGED"
+            self.effectors[canonical]["target_id"] = trk.target_id
+            self.effectors[canonical]["azimuth_deg"] = round(bearing, 1)
+
+        block = self.audit.record_event(
+            event_type="COUNTERMEASURE_ENGAGED",
+            operator=operator,
+            payload={
+                "effector": canonical,
+                "target_id": trk.target_id,
+                "bearing_deg": round(bearing, 1),
+                "range_m": round(math.hypot(trk.east_m, trk.north_m), 1),
+            },
+        )
+        return {
+            "status": "ENGAGED",
+            "effector": canonical,
+            "target_id": trk.target_id,
+            "audit_block_hash": block["block_hash"],
+        }
+
+    def disengage_all(self, operator: str = "LATTICE_OPERATOR") -> Dict[str, Any]:
+        for eff in self.effectors.values():
+            if eff["id"] == "KINETIC_INTERCEPTOR":
+                eff["state"] = f"READY ({eff.get('ammo_remaining', 6)} SILOS)"
+            else:
+                eff["state"] = "STANDBY"
+            eff["target_id"] = None
+
+        for trk in self.tracks.values():
+            if trk.affiliation != "FRIENDLY":
+                trk.active_effectors.clear()
+                trk.status = "ACTIVE"
+                trk.kill_chain_stage = "IDENTIFY"
+
+        block = self.audit.record_event(
+            event_type="EMERGENCY_CEASEFIRE",
+            operator=operator,
+            payload={"all_effectors": "STANDBY"},
+        )
+        return {"status": "ALL_EFFECTORS_DISENGAGED", "audit_block_hash": block["block_hash"]}
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        self.step()
+        computed_tracks = [t.compute_metrics() for t in self.tracks.values()]
+        computed_tracks.sort(
+            key=lambda x: (-1 if x["affiliation"] == "FRIENDLY" else x["threat_score"]),
+            reverse=True,
+        )
+
+        if self.selected_target_id not in self.tracks and computed_tracks:
+            self.selected_target_id = computed_tracks[0]["target_id"]
+
+        max_threat = max((t["threat_score"] for t in computed_tracks), default=0.0)
+        min_range = min(
+            (t["range_m"] for t in computed_tracks if t["affiliation"] != "FRIENDLY"),
+            default=9999.0,
+        )
+
+        if min_range < 500.0 or max_threat >= 80.0:
+            defcon = 1
+            defcon_label = "DEFCON 1 // CRITICAL INTRUSION"
+        elif min_range < 1200.0 or max_threat >= 60.0:
+            defcon = 2
+            defcon_label = "DEFCON 2 // HOSTILE INBOUND"
+        elif max_threat >= 35.0:
+            defcon = 3
+            defcon_label = "DEFCON 3 // ELEVATED WATCH"
+        else:
+            defcon = 5
+            defcon_label = "DEFCON 5 // AIRSPACE NOMINAL"
+
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "uptime_s": int(time.time() - self.boot_time),
+            "scenario": self.scenario,
+            "roe_mode": self.roe_mode,
+            "defcon": defcon,
+            "defcon_label": defcon_label,
+            "radar_sweep_deg": round(self.radar_sweep_deg, 1),
+            "selected_target_id": self.selected_target_id,
+            "neutralized_count": self.neutralized_count,
+            "base_hq": {"lat": BASE_LAT, "lon": BASE_LON},
+            "tracks": computed_tracks,
+            "splash_events": self.splash_events,
+            "effectors": list(self.effectors.values()),
+            "audit_tail": self.audit.chain[-6:][::-1],
+            "ledger_integrity": self.audit.verify_integrity(),
+        }
+
+
+# ============================================================================
+# 3. FASTAPI APPLICATION & REST / WEBSOCKET ENDPOINTS
+# ============================================================================
+
+audit_ledger = LatticeAuditLedger()
+engine = TacticalBattlespaceEngine(audit_ledger)
+
+
+class CountermeasureRequest(BaseModel):
+    effector: str = Field(default="RF_JAMMER")
+    target_id: Optional[str] = Field(default=None)
+    operator: str = Field(default="LATTICE_WEB_C2")
+
+
+class ScenarioRequest(BaseModel):
+    scenario: str
+
+
+class SelectTargetRequest(BaseModel):
+    target_id: str
+
+
+class RoeModeRequest(BaseModel):
+    roe_mode: str
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
 
 app = FastAPI(
-    title="LATTICE-CUAS Tactical C2 System",
-    version="4.0-Lattice",
-    description="Autonomous Multi-Target Counter-Swarm Air Defense & Command Architecture (Anduril Lattice OS)"
+    title="LATTICE-OS v5.0 // Spatial Autonomous Air Defense C2",
+    version="5.0.0-LatticeOS",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
-threat_mgr = ThreatManager()
-countermeasure_ctrl = CountermeasureController(operator_name="COMMANDER_C2")
-audit_logger = ForensicAuditLogger()
-rf_sensor = RFSensorSimulator()
-radar_sensor = RadarSensorSimulator()
 
-class CountermeasureRequest(BaseModel):
-    target_id: int
-    measure_type: str
-    operator: Optional[str] = "COMMANDER_C2"
-    duration_sec: Optional[float] = 12.0
-
-class ScenarioRequest(BaseModel):
-    scenario: str # "SWARM_SATURATION", "FPV_TERMINAL_DIVE", "RF_SILENT_STEALTH", "MIXED_AIRSPACE"
-
-class AutomationModeRequest(BaseModel):
-    mode: str     # "MANUAL_HITL" or "AUTO_ENGAGE_ROE"
+@app.get("/api/v1/status")
+@app.get("/api/v1/telemetry")
+async def get_tactical_telemetry():
+    return JSONResponse(engine.get_snapshot())
 
 
-LATTICE_SPATIAL_OS_HTML = """<!DOCTYPE html>
+@app.post("/api/v1/countermeasures/engage")
+async def engage_countermeasure(req: CountermeasureRequest):
+    return JSONResponse(
+        engine.engage_countermeasure(req.effector, req.target_id, req.operator)
+    )
+
+
+@app.post("/api/v1/countermeasures/disengage")
+async def disengage_countermeasures():
+    return JSONResponse(engine.disengage_all())
+
+
+@app.post("/api/v1/scenario")
+async def switch_scenario(req: ScenarioRequest):
+    engine.load_scenario(req.scenario)
+    return JSONResponse({"status": "OK", "scenario": engine.scenario})
+
+
+@app.post("/api/v1/target/select")
+async def select_target(req: SelectTargetRequest):
+    if req.target_id in engine.tracks:
+        engine.selected_target_id = req.target_id
+    return JSONResponse({"selected_target_id": engine.selected_target_id})
+
+
+@app.post("/api/v1/roe_mode")
+async def set_roe_mode(req: RoeModeRequest):
+    engine.roe_mode = (
+        "AUTO_ENGAGE" if req.roe_mode.upper() == "AUTO_ENGAGE" else "MANUAL_HITL"
+    )
+    audit_ledger.record_event(
+        "ROE_POSTURE_UPDATED", "LATTICE_WEB_C2", {"roe_mode": engine.roe_mode}
+    )
+    return JSONResponse({"roe_mode": engine.roe_mode})
+
+
+@app.get("/api/v1/audit/verify")
+async def verify_audit_chain():
+    return JSONResponse(audit_ledger.verify_integrity())
+
+
+@app.websocket("/ws/telemetry")
+async def websocket_telemetry(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            await ws.send_json(engine.get_snapshot())
+            await asyncio.sleep(0.075)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+
+
+# ============================================================================
+# 4. ANDURIL LATTICE OS — FULL-BLEED 3D SPATIAL BATTLESPACE + FLOATING HUD UI
+# ============================================================================
+
+LATTICE_SPATIAL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LATTICE // AUTONOMOUS AIR DEFENSE OS</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg-void: #04070B;
-      --bg-panel: rgba(8, 14, 26, 0.88);
-      --bg-card: rgba(15, 23, 42, 0.85);
-      --border-cyan: rgba(0, 240, 255, 0.28);
-      --border-hairline: rgba(51, 65, 85, 0.5);
-      --hostile-crimson: #FF2A54;
-      --hostile-glow: rgba(255, 42, 84, 0.4);
-      --suspect-amber: #FFB000;
-      --friendly-cyan: #00F0FF;
-      --cyan-glow: rgba(0, 240, 255, 0.35);
-      --nominal-emerald: #10B981;
-      --text-primary: #F8FAFC;
-      --text-secondary: #94A3B8;
-      --text-muted: #64748B;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body {
-      width: 100vw;
-      height: 100vh;
-      overflow: hidden;
-      background-color: var(--bg-void);
-      color: var(--text-primary);
-      font-family: 'Rajdhani', -apple-system, sans-serif;
-      user-select: none;
-      position: fixed;
-      inset: 0;
-    }
-    .mono {
-      font-family: 'JetBrains Mono', monospace;
-      font-variant-numeric: tabular-nums;
-    }
-    .chakra {
-      font-family: 'Chakra Petch', sans-serif;
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-    }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LATTICE-OS v5.0 // Autonomous Counter-UAS Spatial Battlespace</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --void: #03060C;
+    --glass: rgba(8, 13, 24, 0.80);
+    --glass-heavy: rgba(6, 10, 19, 0.90);
+    --card-bg: rgba(15, 23, 42, 0.72);
+    --border-subtle: rgba(56, 189, 248, 0.20);
+    --border-bright: rgba(0, 240, 255, 0.55);
+    --cyan: #00F0FF;
+    --sky: #0EA5E9;
+    --crimson: #FF2A54;
+    --amber: #FFB000;
+    --emerald: #10B981;
+    --purple: #A855F7;
+    --text-main: #F8FAFC;
+    --text-dim: #94A3B8;
+    --text-muted: #64748B;
+  }
 
-    /* FULL-BLEED BATTLESPACE CANVAS (Z-INDEX 1) */
-    #battlespace-canvas {
-      position: fixed;
-      inset: 0;
-      width: 100vw;
-      height: 100vh;
-      z-index: 1;
-      display: block;
-      cursor: crosshair;
-    }
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    user-select: none;
+  }
 
-    /* DYNAMIC TETHER LEADER SVG (Z-INDEX 5) */
-    #tether-svg {
-      position: fixed;
-      inset: 0;
-      width: 100vw;
-      height: 100vh;
-      z-index: 5;
-      pointer-events: none;
-    }
+  html, body {
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: var(--void);
+    color: var(--text-main);
+    font-family: 'Inter', sans-serif;
+    font-size: 11.5px;
+    -webkit-font-smoothing: antialiased;
+  }
 
-    /* SPATIAL HUD OVERLAYS ROOT (Z-INDEX 10) */
-    .spatial-hud-root {
-      position: fixed;
-      inset: 0;
-      z-index: 10;
-      pointer-events: none;
-    }
+  .mono {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
 
-    /* PRECISION MILITARY CHAMFERED POD GEOMETRY */
-    .hud-pod {
-      pointer-events: auto;
-      position: fixed;
-      background: linear-gradient(135deg, rgba(8, 14, 26, 0.90) 0%, rgba(4, 7, 14, 0.95) 100%);
-      backdrop-filter: blur(20px) saturate(190%);
-      -webkit-backdrop-filter: blur(20px) saturate(190%);
-      border: 1px solid var(--border-cyan);
-      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.8), inset 0 0 1px rgba(0, 240, 255, 0.4);
-      clip-path: polygon(
-        0 12px, 12px 0,
-        calc(100% - 12px) 0, 100% 12px,
-        100% calc(100% - 12px), calc(100% - 12px) 100%,
-        12px 100%, 0 calc(100% - 12px)
-      );
-      transition: border-color 0.2s, box-shadow 0.2s;
-    }
-    .hud-pod:hover {
-      border-color: rgba(0, 240, 255, 0.5);
-      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.9), inset 0 0 2px rgba(0, 240, 255, 0.6);
-    }
+  /* 1. FULL-BLEED 100VW x 100VH INTERACTIVE 3D BATTLESPACE CANVAS */
+  #battlespaceCanvas {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 1;
+    cursor: grab;
+  }
+  #battlespaceCanvas:active {
+    cursor: grabbing;
+  }
 
-    /* CORNER FIDUCIALS */
-    .fiducial-tl, .fiducial-tr, .fiducial-bl, .fiducial-br {
-      position: absolute;
-      width: 8px;
-      height: 8px;
-      pointer-events: none;
-    }
-    .fiducial-tl { top: 3px; left: 3px; border-top: 1.5px solid var(--friendly-cyan); border-left: 1.5px solid var(--friendly-cyan); }
-    .fiducial-tr { top: 3px; right: 3px; border-top: 1.5px solid var(--friendly-cyan); border-right: 1.5px solid var(--friendly-cyan); }
-    .fiducial-bl { bottom: 3px; left: 3px; border-bottom: 1.5px solid var(--friendly-cyan); border-left: 1.5px solid var(--friendly-cyan); }
-    .fiducial-br { bottom: 3px; right: 3px; border-bottom: 1.5px solid var(--friendly-cyan); border-right: 1.5px solid var(--friendly-cyan); }
+  /* SUBTLE TACTICAL VIGNETTE & CRT SCANLINE OVERLAY */
+  .tactical-vignette {
+    position: fixed;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+    background:
+      radial-gradient(circle at 50% 50%, transparent 52%, rgba(2, 5, 11, 0.75) 100%),
+      repeating-linear-gradient(0deg, rgba(255,255,255,0.012) 0px, rgba(255,255,255,0.012) 1px, transparent 1px, transparent 3px);
+  }
 
-    .pod-header {
-      height: 32px;
-      background: rgba(15, 23, 42, 0.7);
-      border-bottom: 1px solid var(--border-cyan);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 14px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      color: var(--friendly-cyan);
-      flex-shrink: 0;
-    }
-    .pod-header .wm {
-      font-size: 9px;
-      color: var(--text-muted);
-      font-family: 'JetBrains Mono', monospace;
-    }
+  /* CHAMFERED GLASSMORPHIC HUD POD BASE */
+  .hud-pod {
+    position: fixed;
+    z-index: 10;
+    background: linear-gradient(155deg, rgba(11, 18, 32, 0.84) 0%, rgba(5, 9, 18, 0.90) 100%);
+    backdrop-filter: blur(16px) saturate(180%);
+    -webkit-backdrop-filter: blur(16px) saturate(180%);
+    border: 1px solid var(--border-subtle);
+    clip-path: polygon(
+      0 10px, 10px 0,
+      calc(100% - 10px) 0, 100% 10px,
+      100% calc(100% - 10px), calc(100% - 10px) 100%,
+      10px 100%, 0 calc(100% - 10px)
+    );
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.65), inset 0 0 22px rgba(0, 240, 255, 0.03);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
 
-    /* ZONE A — TOP CENTER FLOATING COMMAND BAR */
-    #zone-a-bar {
-      top: 12px;
-      left: 50%;
-      transform: translateX(-50%);
-      height: 48px;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 0 18px;
-      z-index: 100;
-    }
-    .brand-mark {
-      width: 24px;
-      height: 24px;
-      border: 2px solid var(--friendly-cyan);
-      transform: rotate(45deg);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      box-shadow: 0 0 10px var(--cyan-glow);
-    }
-    .brand-inner {
-      width: 8px;
-      height: 8px;
-      background: var(--friendly-cyan);
-    }
-    .brand-title {
-      font-size: 15px;
-      font-weight: 700;
-      letter-spacing: 0.16em;
-      color: var(--text-primary);
-    }
-    .defcon-pill {
-      font-size: 11px;
-      font-weight: 700;
-      padding: 4px 12px;
-      border-radius: 2px;
-      border: 1px solid var(--hostile-crimson);
-      color: var(--hostile-crimson);
-      background: rgba(255, 42, 84, 0.15);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      box-shadow: 0 0 12px var(--hostile-glow);
-      animation: pulseDefcon 1.8s infinite;
-      cursor: pointer;
-    }
-    @keyframes pulseDefcon {
-      0%, 100% { box-shadow: 0 0 8px var(--hostile-glow); }
-      50% { box-shadow: 0 0 20px var(--hostile-glow); }
-    }
-    .pill-btn {
-      background: var(--bg-card);
-      border: 1px solid var(--border-hairline);
-      color: var(--text-secondary);
-      font-family: 'Rajdhani', sans-serif;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      padding: 4px 10px;
-      border-radius: 2px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      transition: all 0.15s;
-    }
-    .pill-btn:hover, .pill-btn.active {
-      color: var(--friendly-cyan);
-      border-color: var(--friendly-cyan);
-      background: rgba(0, 240, 255, 0.12);
-      box-shadow: 0 0 8px var(--cyan-glow);
-    }
-    .scenario-dropdown {
-      background: var(--bg-card);
-      border: 1px solid var(--border-cyan);
-      color: var(--friendly-cyan);
-      font-family: 'Rajdhani', sans-serif;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      padding: 4px 8px;
-      border-radius: 2px;
-      outline: none;
-      cursor: pointer;
-    }
+  .pod-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: linear-gradient(90deg, rgba(0, 240, 255, 0.10) 0%, rgba(15, 23, 42, 0.4) 100%);
+    border-bottom: 1px solid var(--border-subtle);
+    flex-shrink: 0;
+  }
 
-    /* ZONE B — TOP-LEFT FLOATING EO/IR GIMBAL POD */
-    #zone-b-pod {
-      top: 68px;
-      left: 16px;
-      width: 370px;
-      height: 290px;
-      display: flex;
-      flex-direction: column;
-    }
-    .optronic-viewport {
-      flex: 1;
-      position: relative;
-      background: #000;
-      overflow: hidden;
-    }
-    #optronic-canvas {
-      width: 100%;
-      height: 100%;
-      display: block;
-    }
-    .pip-zoom-loupe {
-      position: absolute;
-      top: 10px;
-      right: 10px;
-      width: 100px;
-      height: 100px;
-      border: 1px solid var(--friendly-cyan);
-      background: rgba(4, 7, 14, 0.85);
-      box-shadow: 0 4px 16px rgba(0,0,0,0.8);
-      display: flex;
-      flex-direction: column;
-    }
-    .pip-label {
-      font-size: 8px;
-      font-weight: 700;
-      background: rgba(0, 240, 255, 0.2);
-      color: var(--friendly-cyan);
-      padding: 2px 4px;
-      letter-spacing: 0.5px;
-    }
-    #pip-canvas {
-      width: 100%;
-      flex: 1;
-      display: block;
-    }
-    .sensor-mode-strip {
-      display: flex;
-      gap: 4px;
-      padding: 6px 10px;
-      background: rgba(8, 14, 26, 0.95);
-      border-top: 1px solid var(--border-hairline);
-    }
-    .shader-btn {
-      flex: 1;
-      background: var(--bg-card);
-      border: 1px solid var(--border-hairline);
-      color: var(--text-muted);
-      font-family: 'Rajdhani', sans-serif;
-      font-size: 10px;
-      font-weight: 700;
-      padding: 3px 0;
-      text-align: center;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .shader-btn:hover, .shader-btn.active {
-      color: var(--friendly-cyan);
-      border-color: var(--friendly-cyan);
-      background: rgba(0, 240, 255, 0.15);
-    }
+  .pod-title {
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: #E2E8F0;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
 
-    /* ZONE C — BOTTOM-LEFT FLOATING SWARM TRACK MATRIX */
-    #zone-c-pod {
-      bottom: 16px;
-      left: 16px;
-      width: 410px;
-      height: 380px;
-      display: flex;
-      flex-direction: column;
-    }
-    .track-table-body {
-      flex: 1;
-      overflow-y: auto;
-      scrollbar-width: thin;
-      scrollbar-color: var(--border-cyan) transparent;
-    }
-    table.track-matrix {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 11px;
-    }
-    table.track-matrix th {
-      position: sticky;
-      top: 0;
-      background: rgba(15, 23, 42, 0.92);
-      padding: 6px 8px;
-      text-align: left;
-      font-weight: 700;
-      color: var(--text-muted);
-      border-bottom: 1px solid var(--border-cyan);
-      font-size: 10px;
-      letter-spacing: 0.08em;
-    }
-    table.track-matrix td {
-      padding: 6px 8px;
-      border-bottom: 1px solid var(--border-hairline);
-      color: var(--text-secondary);
-      cursor: pointer;
-      vertical-align: middle;
-      transition: background 0.1s;
-    }
-    table.track-matrix tr:hover td {
-      background: rgba(0, 240, 255, 0.08);
-      color: var(--text-primary);
-    }
-    table.track-matrix tr.locked td {
-      background: rgba(0, 240, 255, 0.16);
-      color: var(--friendly-cyan);
-      font-weight: 700;
-    }
-    .badge {
-      display: inline-block;
-      padding: 1px 5px;
-      border-radius: 2px;
-      font-size: 9px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-    }
-    .badge-crimson { background: rgba(255, 42, 84, 0.2); color: var(--hostile-crimson); border: 1px solid var(--hostile-crimson); }
-    .badge-amber { background: rgba(255, 176, 0, 0.2); color: var(--suspect-amber); border: 1px solid var(--suspect-amber); }
-    .badge-cyan { background: rgba(0, 240, 255, 0.2); color: var(--friendly-cyan); border: 1px solid var(--friendly-cyan); }
-    .badge-emerald { background: rgba(16, 185, 129, 0.2); color: var(--nominal-emerald); border: 1px solid var(--nominal-emerald); }
+  .pod-tag {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    padding: 2px 6px;
+    background: rgba(0, 240, 255, 0.10);
+    border: 1px solid rgba(0, 240, 255, 0.35);
+    color: var(--cyan);
+  }
 
-    .tti-bar-wrap {
-      width: 48px;
-      height: 6px;
-      background: rgba(51, 65, 85, 0.5);
-      border-radius: 2px;
-      overflow: hidden;
-      display: inline-block;
-      vertical-align: middle;
-      margin-left: 4px;
-    }
-    .tti-bar-fill {
-      height: 100%;
-      background: var(--hostile-crimson);
-      transition: width 0.3s;
-    }
+  .led-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 8px var(--cyan);
+  }
 
-    /* ZONE D — RIGHT FLOATING TARGET INTELLIGENCE DOSSIER */
-    #zone-d-pod {
-      top: 68px;
-      right: 16px;
-      width: 390px;
-      bottom: 84px;
-      display: flex;
-      flex-direction: column;
-      overflow-y: auto;
-      scrollbar-width: thin;
-      scrollbar-color: var(--border-cyan) transparent;
-    }
-    .dossier-content {
-      padding: 14px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .dossier-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .threat-dial-row {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      background: rgba(15, 23, 42, 0.6);
-      padding: 10px 14px;
-      border: 1px solid var(--border-hairline);
-      border-radius: 2px;
-    }
-    .dial-svg-wrap {
-      width: 74px;
-      height: 74px;
-      position: relative;
-      flex-shrink: 0;
-    }
-    .dial-svg-wrap svg {
-      width: 100%;
-      height: 100%;
-      transform: rotate(-90deg);
-    }
-    .dial-num {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      font-size: 18px;
-      font-weight: 700;
-      color: var(--hostile-crimson);
-    }
-    .dial-subscores {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .subscore-line {
-      display: flex;
-      justify-content: space-between;
-      font-size: 10px;
-      color: var(--text-secondary);
-    }
-    .subscore-line strong { color: var(--text-primary); }
+  /* ZONE A: TOP-CENTER FLOATING COMMAND BAR */
+  .top-command-bar {
+    top: 12px;
+    left: 14px;
+    right: 14px;
+    height: 44px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+  }
 
-    .telemetry-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 6px;
-    }
-    .telem-box {
-      background: rgba(15, 23, 42, 0.6);
-      border: 1px solid var(--border-hairline);
-      padding: 6px 10px;
-      border-radius: 2px;
-    }
-    .telem-lbl {
-      font-size: 9px;
-      color: var(--text-muted);
-      letter-spacing: 0.5px;
-      text-transform: uppercase;
-    }
-    .telem-val {
-      font-size: 13px;
-      font-weight: 700;
-      color: var(--text-primary);
-      margin-top: 2px;
-    }
+  .brand-block {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
 
-    .imm-mode-box {
-      background: rgba(15, 23, 42, 0.6);
-      border: 1px solid var(--border-hairline);
-      padding: 8px 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .imm-bar-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-size: 10px;
-    }
-    .imm-prog-bg {
-      width: 130px;
-      height: 6px;
-      background: rgba(51, 65, 85, 0.5);
-      border-radius: 2px;
-      overflow: hidden;
-    }
-    .imm-prog-fill {
-      height: 100%;
-      background: var(--friendly-cyan);
-      transition: width 0.3s;
-    }
+  .lattice-hex {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--cyan);
+    background: rgba(0, 240, 255, 0.1);
+  }
 
-    .spectrogram-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-    }
-    .spec-box {
-      background: #020408;
-      border: 1px solid var(--border-cyan);
-      padding: 6px;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .spec-title {
-      font-size: 9px;
-      font-weight: 700;
-      color: var(--text-secondary);
-      letter-spacing: 0.5px;
-    }
-    canvas.spec-canvas {
-      width: 100%;
-      height: 70px;
-      background: #000;
-      display: block;
-    }
+  .brand-name {
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 13.5px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: #FFFFFF;
+  }
 
-    /* ZONE E — BOTTOM-CENTER AUTONOMOUS KILL-CHAIN DOCK */
-    #zone-e-dock {
-      bottom: 14px;
-      left: 50%;
-      transform: translateX(-50%);
-      width: 740px;
-      display: flex;
-      flex-direction: column;
-    }
-    .killchain-stepper {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 8px 16px;
-      background: rgba(15, 23, 42, 0.7);
-      border-bottom: 1px solid var(--border-cyan);
-    }
-    .kc-step {
-      font-size: 10px;
-      font-weight: 700;
-      color: var(--text-muted);
-      letter-spacing: 0.1em;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .kc-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--text-muted);
-    }
-    .kc-step.active {
-      color: var(--hostile-crimson);
-    }
-    .kc-step.active .kc-dot {
-      background: var(--hostile-crimson);
-      box-shadow: 0 0 8px var(--hostile-glow);
-    }
-    .kc-arrow {
-      color: var(--border-cyan);
-      font-size: 10px;
-    }
+  .brand-sub {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 8.5px;
+    color: var(--cyan);
+    letter-spacing: 1px;
+  }
 
-    .effector-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr) 140px;
-      gap: 8px;
-      padding: 10px 14px;
-      background: rgba(8, 14, 26, 0.95);
-    }
-    .effector-btn {
-      background: rgba(15, 23, 42, 0.85);
-      border: 1px solid var(--border-hairline);
-      padding: 8px 10px;
-      border-radius: 2px;
-      cursor: pointer;
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-      transition: all 0.15s;
-    }
-    .effector-btn:hover {
-      border-color: var(--friendly-cyan);
-      background: rgba(0, 240, 255, 0.1);
-      box-shadow: 0 0 10px var(--cyan-glow);
-    }
-    .effector-btn.active {
-      border-color: var(--hostile-crimson);
-      background: rgba(255, 42, 84, 0.2);
-      box-shadow: 0 0 12px var(--hostile-glow);
-    }
-    .eff-title {
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--text-primary);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .eff-sub {
-      font-size: 9px;
-      color: var(--text-muted);
-    }
-    .eff-status {
-      font-size: 9px;
-      font-weight: 700;
-      color: var(--nominal-emerald);
-      margin-top: 2px;
-    }
-    .ceasefire-pod-btn {
-      background: rgba(255, 42, 84, 0.18);
-      border: 1px solid var(--hostile-crimson);
-      color: var(--hostile-crimson);
-      font-family: 'Rajdhani', sans-serif;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      border-radius: 2px;
-      cursor: pointer;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      box-shadow: 0 0 8px var(--hostile-glow);
-      transition: all 0.15s;
-    }
-    .ceasefire-pod-btn:hover {
-      background: rgba(255, 42, 84, 0.35);
-      box-shadow: 0 0 16px var(--hostile-glow);
-    }
+  .top-center-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
 
-    .audit-strip {
-      background: #020408;
-      border-top: 1px solid var(--border-cyan);
-      padding: 4px 14px;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-size: 10px;
-      color: var(--text-muted);
-    }
-    .audit-ticker {
-      flex: 1;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      color: var(--friendly-cyan);
-    }
+  .hud-btn, .hud-select {
+    background: rgba(15, 23, 42, 0.85);
+    color: var(--text-main);
+    border: 1px solid rgba(56, 189, 248, 0.30);
+    padding: 5px 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
 
-    /* CONTROLS HINT TOOLTIP (BOTTOM RIGHT) */
-    .controls-hint {
-      position: fixed;
-      bottom: 16px;
-      right: 16px;
-      font-size: 9px;
-      color: var(--text-muted);
-      background: rgba(8, 14, 26, 0.7);
-      padding: 4px 8px;
-      border: 1px solid var(--border-hairline);
-      border-radius: 2px;
-      z-index: 100;
-      pointer-events: none;
-    }
-  </style>
+  .hud-btn:hover, .hud-select:hover, .hud-btn.active {
+    border-color: var(--cyan);
+    background: rgba(0, 240, 255, 0.16);
+    color: #FFFFFF;
+    box-shadow: 0 0 12px rgba(0, 240, 255, 0.25);
+  }
+
+  .defcon-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 12px;
+    background: rgba(255, 42, 84, 0.16);
+    border: 1px solid var(--crimson);
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    color: #FFE4E6;
+  }
+
+  .pulse-crimson {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--crimson);
+    box-shadow: 0 0 10px var(--crimson);
+    animation: pulseGlow 1.1s infinite;
+  }
+
+  @keyframes pulseGlow {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(0.8); opacity: 0.35; }
+  }
+
+  .top-telemetry-pills {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+
+  /* ZONE B: TOP-LEFT EO/IR GIMBAL TARGETING POD */
+  .pod-optronic {
+    top: 66px;
+    left: 14px;
+    width: 355px;
+    height: 262px;
+  }
+
+  .shader-tabs {
+    display: flex;
+    gap: 3px;
+  }
+
+  .shader-tab {
+    background: rgba(15, 23, 42, 0.8);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 8.5px;
+    padding: 2px 5px;
+    cursor: pointer;
+  }
+  .shader-tab.active {
+    background: rgba(0, 240, 255, 0.18);
+    color: var(--cyan);
+    border-color: var(--cyan);
+  }
+
+  .optronic-viewport {
+    flex: 1;
+    position: relative;
+    background: #020408;
+    min-height: 0;
+  }
+
+  .optronic-bar {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 10px;
+    background: rgba(4, 8, 16, 0.92);
+    border-top: 1px solid var(--border-subtle);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    color: var(--text-dim);
+  }
+
+  /* ZONE C: BOTTOM-LEFT SWARM TRACK MATRIX */
+  .pod-swarm-queue {
+    top: 338px;
+    bottom: 14px;
+    left: 14px;
+    width: 355px;
+  }
+
+  .track-list-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .track-list-scroll::-webkit-scrollbar { width: 3px; }
+  .track-list-scroll::-webkit-scrollbar-thumb { background: var(--cyan); }
+
+  .track-card {
+    background: rgba(15, 23, 42, 0.65);
+    border: 1px solid rgba(51, 65, 85, 0.6);
+    border-left: 3px solid var(--text-muted);
+    padding: 6px 8px;
+    cursor: pointer;
+    transition: all 0.12s ease;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .track-card:hover {
+    background: rgba(30, 41, 59, 0.85);
+    border-color: rgba(0, 240, 255, 0.4);
+  }
+
+  .track-card.selected {
+    background: rgba(0, 240, 255, 0.12);
+    border-color: var(--cyan);
+    border-left: 3px solid var(--cyan);
+    box-shadow: inset 0 0 14px rgba(0, 240, 255, 0.12);
+  }
+
+  .track-card.aff-HOSTILE { border-left-color: var(--crimson); }
+  .track-card.aff-SUSPECT { border-left-color: var(--amber); }
+  .track-card.aff-FRIENDLY { border-left-color: var(--sky); }
+  .track-card.aff-NEUTRAL { border-left-color: var(--emerald); }
+
+  .tc-row1, .tc-row2 {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .tc-id {
+    font-size: 11px;
+    font-weight: 700;
+    color: #FFFFFF;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .badge-aff {
+    font-size: 8.5px;
+    padding: 1px 4px;
+    font-weight: 700;
+  }
+  .badge-HOSTILE { background: rgba(255, 42, 84, 0.2); color: var(--crimson); border: 1px solid var(--crimson); }
+  .badge-SUSPECT { background: rgba(255, 176, 0, 0.2); color: var(--amber); border: 1px solid var(--amber); }
+  .badge-FRIENDLY { background: rgba(14, 165, 233, 0.2); color: var(--sky); border: 1px solid var(--sky); }
+  .badge-NEUTRAL { background: rgba(16, 185, 129, 0.2); color: var(--emerald); border: 1px solid var(--emerald); }
+
+  .sensor-chip {
+    font-size: 8px;
+    padding: 1px 4px;
+    background: rgba(0, 240, 255, 0.1);
+    color: var(--cyan);
+    border: 1px solid rgba(0, 240, 255, 0.25);
+  }
+
+  /* ZONE D: RIGHT FLOATING TARGET DOSSIER & SPECTRUM POD */
+  .pod-dossier {
+    top: 66px;
+    right: 14px;
+    bottom: 14px;
+    width: 365px;
+  }
+
+  .dossier-content {
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex: 1;
+    min-height: 0;
+    justify-content: space-between;
+  }
+
+  .dossier-hero {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(51, 65, 85, 0.5);
+  }
+
+  .hero-callsign {
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #FFFFFF;
+  }
+
+  .hero-class {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--crimson);
+    font-weight: 600;
+  }
+
+  .threat-dial-box {
+    text-align: right;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .threat-big-num {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--crimson);
+  }
+
+  .telemetry-matrix {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 5px;
+  }
+
+  .t-cell {
+    background: rgba(15, 23, 42, 0.75);
+    border: 1px solid rgba(51, 65, 85, 0.55);
+    padding: 5px 7px;
+  }
+
+  .t-lbl {
+    font-size: 8.5px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+  }
+
+  .t-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--text-main);
+    margin-top: 2px;
+  }
+
+  .subscore-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: rgba(9, 14, 26, 0.75);
+    border: 1px solid rgba(51, 65, 85, 0.5);
+    padding: 6px 8px;
+  }
+
+  .sub-row {
+    display: grid;
+    grid-template-columns: 118px 1fr 34px;
+    align-items: center;
+    gap: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+  }
+
+  .bar-bg {
+    height: 5px;
+    background: #1E293B;
+    overflow: hidden;
+  }
+
+  .bar-fg {
+    height: 100%;
+    background: linear-gradient(90deg, var(--cyan), var(--crimson));
+    transition: width 0.15s ease;
+  }
+
+  .spectrum-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .spec-box {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #03060C;
+    border: 1px solid rgba(51, 65, 85, 0.6);
+    min-height: 0;
+  }
+
+  .spec-head {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 8px;
+    background: rgba(15, 23, 42, 0.8);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--text-dim);
+    border-bottom: 1px solid rgba(51, 65, 85, 0.4);
+  }
+
+  .spec-canvas-wrap {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+  }
+
+  /* ZONE E: BOTTOM-CENTER KILL-CHAIN & EFFECTOR ACTION DOCK */
+  .pod-effector-dock {
+    bottom: 14px;
+    left: 381px;
+    right: 391px;
+    height: 146px;
+  }
+
+  /* KILL CHAIN CHEVRON STEPPER */
+  .kill-chain-bar {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 4px;
+    padding: 5px 10px;
+    background: rgba(4, 8, 16, 0.85);
+    border-bottom: 1px solid var(--border-subtle);
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 1px;
+  }
+
+  .kc-step {
+    text-align: center;
+    padding: 2px 4px;
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(51, 65, 85, 0.5);
+    color: var(--text-muted);
+  }
+
+  .kc-step.active {
+    background: rgba(0, 240, 255, 0.16);
+    border-color: var(--cyan);
+    color: var(--cyan);
+  }
+
+  .kc-step.engage-active {
+    background: rgba(255, 42, 84, 0.22);
+    border-color: var(--crimson);
+    color: #FFE4E6;
+  }
+
+  /* 4 HORIZONTAL EFFECTOR TRIGGER CARDS */
+  .dock-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr) 115px;
+    gap: 6px;
+    padding: 7px 10px;
+    flex: 1;
+    align-items: stretch;
+  }
+
+  .dock-card {
+    background: rgba(15, 23, 42, 0.82);
+    border: 1px solid rgba(56, 189, 248, 0.28);
+    padding: 6px 8px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    text-align: left;
+    color: var(--text-main);
+    transition: all 0.12s ease;
+    position: relative;
+  }
+
+  .dock-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--cyan);
+    background: rgba(22, 33, 58, 0.92);
+    box-shadow: 0 4px 16px rgba(0, 240, 255, 0.18);
+  }
+
+  .dock-card.engaged {
+    background: rgba(255, 42, 84, 0.18);
+    border-color: var(--crimson);
+    box-shadow: 0 0 18px rgba(255, 42, 84, 0.3);
+  }
+
+  .dc-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 8.5px;
+  }
+
+  .hotkey-chip {
+    padding: 1px 4px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: var(--cyan);
+  }
+
+  .dc-title {
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    color: #FFFFFF;
+  }
+
+  .dc-state {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 8.5px;
+    color: var(--text-dim);
+  }
+
+  .ceasefire-dock-btn {
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid var(--emerald);
+    color: #A7F3D0;
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    transition: all 0.15s;
+  }
+  .ceasefire-dock-btn:hover {
+    background: rgba(16, 185, 129, 0.26);
+  }
+
+  /* SHA-256 FORENSIC LEDGER FOOTER RIBBON */
+  .ledger-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 12px;
+    background: rgba(3, 6, 12, 0.95);
+    border-top: 1px solid rgba(51, 65, 85, 0.5);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--text-dim);
+  }
+
+  /* BATTLESPACE CAMERA HINT PILL */
+  .camera-hint {
+    position: fixed;
+    top: 66px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 6;
+    background: rgba(6, 10, 19, 0.76);
+    border: 1px solid rgba(0, 240, 255, 0.28);
+    padding: 4px 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    color: var(--text-dim);
+    pointer-events: none;
+  }
+</style>
 </head>
 <body>
 
-  <!-- FULL-BLEED BATTLESPACE 3D/2.5D CANVAS (Z-INDEX 1) -->
-  <canvas id="battlespace-canvas"></canvas>
+<!-- 1. FULL-BLEED 100VW x 100VH INTERACTIVE 3D BATTLESPACE CANVAS -->
+<canvas id="battlespaceCanvas"></canvas>
+<div class="tactical-vignette"></div>
 
-  <!-- DYNAMIC TETHER LEADER-LINE SVG (Z-INDEX 5) -->
-  <svg id="tether-svg">
-    <defs>
-      <filter id="glow-line" x="-20%" y="-20%" width="140%" height="140%">
-        <feGaussianBlur stdDeviation="3" result="blur" />
-        <feMerge>
-          <feMergeNode in="blur" />
-          <feMergeNode in="SourceGraphic" />
-        </feMerge>
-      </filter>
-    </defs>
-    <path id="leader-path" d="" fill="none" stroke="var(--friendly-cyan)" stroke-width="1.5" stroke-dasharray="6,4" filter="url(#glow-line)" opacity="0.85"/>
-    <circle id="leader-dot-tgt" cx="-100" cy="-100" r="4" fill="var(--hostile-crimson)" stroke="#fff" stroke-width="1.5"/>
-    <circle id="leader-dot-card" cx="-100" cy="-100" r="3" fill="var(--friendly-cyan)"/>
-  </svg>
+<div class="camera-hint">
+  3D SPATIAL DOME // DRAG MOUSE TO ORBIT &amp; TILT &bull; SCROLL TO ZOOM &bull; CLICK TRACK TO LOCK &bull; KEYS [1-4] ENGAGE
+</div>
 
-  <!-- SPATIAL HUD OVERLAYS (Z-INDEX 10) -->
-  <div class="spatial-hud-root">
-
-    <!-- ZONE A: FLOATING TOP TACTICAL COMMAND BAR -->
-    <div id="zone-a-bar" class="hud-pod">
-      <div class="fiducial-tl"></div><div class="fiducial-tr"></div><div class="fiducial-bl"></div><div class="fiducial-br"></div>
-      
-      <div style="display:flex; align-items:center; gap:10px;">
-        <div class="brand-mark"><div class="brand-inner"></div></div>
-        <div>
-          <div class="brand-title chakra">LATTICE-OS // C2</div>
-          <div class="wm mono" style="font-size:8px; color:var(--friendly-cyan);">SPATIAL AIR DEFENSE v4.0</div>
-        </div>
-      </div>
-
-      <div id="defcon-indicator" class="defcon-pill" onclick="cycleDefcon()">
-        <span class="mono" id="defcon-text">DEFCON 1 // CRITICAL</span>
-      </div>
-
-      <div style="display:flex; gap:6px;">
-        <button class="pill-btn active" id="btn-view-3d" onclick="setViewMode('3D_ISOMETRIC')">3D ISOMETRIC</button>
-        <button class="pill-btn" id="btn-view-2d" onclick="setViewMode('2D_PLANAR')">2D PLANAR</button>
-      </div>
-
-      <select id="scenario-selector" class="scenario-dropdown" onchange="switchScenario(this.value)">
-        <option value="SWARM_SATURATION">SCENARIO: SWARM SATURATION (8 UAVs)</option>
-        <option value="FPV_TERMINAL_DIVE">SCENARIO: FPV TERMINAL SUICIDE DIVE</option>
-        <option value="RF_SILENT_STEALTH">SCENARIO: RF-SILENT AUTONOMOUS MUNITION</option>
-        <option value="MIXED_AIRSPACE">SCENARIO: MIXED CIVILIAN / HOSTILE</option>
-      </select>
-
-      <button id="btn-autonomy" class="pill-btn" onclick="toggleAutonomy()">
-        ROE: <strong id="autonomy-txt" style="color:var(--nominal-emerald);">AUTO-ENGAGE</strong>
-      </button>
-
-      <button id="btn-audio" class="pill-btn" onclick="toggleAudioMaster()">
-        AUDIO: <strong id="audio-txt" style="color:var(--friendly-cyan);">SYNTH ON</strong>
-      </button>
-
-      <div class="mono" id="utc-clock" style="font-size:12px; color:var(--text-primary); margin-left:6px;">00:00:00 UTC</div>
+<!-- ZONE A: TOP FLOATING TACTICAL COMMAND BAR -->
+<header class="hud-pod top-command-bar">
+  <div class="brand-block">
+    <div class="lattice-hex">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#00F0FF" stroke-width="2">
+        <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/>
+        <circle cx="12" cy="12" r="3"/>
+      </svg>
     </div>
-
-    <!-- ZONE B: FLOATING EO/IR GIMBAL POD -->
-    <div id="zone-b-pod" class="hud-pod">
-      <div class="fiducial-tl"></div><div class="fiducial-tr"></div><div class="fiducial-bl"></div><div class="fiducial-br"></div>
-      <div class="pod-header">
-        <span>OPTRONIC EO/IR GIMBAL // TGT LOCK</span>
-        <span class="wm mono" id="gimbal-fov-txt">FOV: 14.2° | 12X</span>
-      </div>
-
-      <div class="optronic-viewport">
-        <canvas id="optronic-canvas" width="370" height="215"></canvas>
-        <div class="pip-zoom-loupe">
-          <div class="pip-label">PIP 4X LOUPE</div>
-          <canvas id="pip-canvas" width="100" height="80"></canvas>
-        </div>
-      </div>
-
-      <div class="sensor-mode-strip">
-        <div class="shader-btn active" id="btn-sh-eo" onclick="setShaderMode('EO_DAYLIGHT')">EO DAYLIGHT</div>
-        <div class="shader-btn" id="btn-sh-flir-w" onclick="setShaderMode('FLIR_WHITE_HOT')">FLIR W-HOT</div>
-        <div class="shader-btn" id="btn-sh-flir-b" onclick="setShaderMode('FLIR_BLACK_HOT')">FLIR B-HOT</div>
-        <div class="shader-btn" id="btn-sh-swir" onclick="setShaderMode('SWIR_NIGHT_VISION')">SWIR NV</div>
-      </div>
+    <div>
+      <div class="brand-name">LATTICE-OS // C-UAS</div>
+      <div class="brand-sub">AUTONOMOUS SPATIAL BATTLESPACE C2 v5.0</div>
     </div>
-
-    <!-- ZONE C: FLOATING SWARM TRACK MATRIX -->
-    <div id="zone-c-pod" class="hud-pod">
-      <div class="fiducial-tl"></div><div class="fiducial-tr"></div><div class="fiducial-bl"></div><div class="fiducial-br"></div>
-      <div class="pod-header">
-        <span>ACTIVE SWARM TRACKS [8]</span>
-        <span class="wm mono" id="matrix-swarm-index" style="color:var(--hostile-crimson);">THREAT INDEX: 94.2/100</span>
-      </div>
-
-      <div class="track-table-body">
-        <table class="track-matrix">
-          <thead>
-            <tr>
-              <th>TRK-ID</th>
-              <th>CLASS</th>
-              <th>RANGE</th>
-              <th>SPEED</th>
-              <th>TTI</th>
-              <th>SENSORS</th>
-              <th>ACT</th>
-            </tr>
-          </thead>
-          <tbody id="track-matrix-tbody">
-            <!-- Populated dynamically via JS -->
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- ZONE D: FLOATING TARGET INTELLIGENCE DOSSIER -->
-    <div id="zone-d-pod" class="hud-pod">
-      <div class="fiducial-tl"></div><div class="fiducial-tr"></div><div class="fiducial-bl"></div><div class="fiducial-br"></div>
-      <div class="pod-header">
-        <span>TARGET DOSSIER // WTA</span>
-        <span class="badge badge-crimson" id="dos-killchain-tag">ENGAGE [STAGE 5]</span>
-      </div>
-
-      <div class="dossier-content">
-        <div class="dossier-top">
-          <div>
-            <div class="mono" style="font-size:16px; font-weight:700; color:var(--text-primary);" id="dos-track-id">TRK #101-ALPHA</div>
-            <div style="font-size:11px; color:var(--text-muted);" id="dos-class-label">SUICIDE FPV LOITERING MUNITION</div>
-          </div>
-          <span class="badge badge-crimson" id="dos-severity-badge">CRITICAL (94.2)</span>
-        </div>
-
-        <!-- Threat Dial & Subscores -->
-        <div class="threat-dial-row">
-          <div class="dial-svg-wrap">
-            <svg viewBox="0 0 36 36">
-              <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(51, 65, 85, 0.4)" stroke-width="3.5" />
-              <path id="dial-arc" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="var(--hostile-crimson)" stroke-width="3.5" stroke-dasharray="94, 100" />
-            </svg>
-            <div class="dial-num mono" id="dial-score-num">94</div>
-          </div>
-          <div class="dial-subscores">
-            <div class="subscore-line"><span>Kinematic Lethality:</span><strong class="mono" id="sub-kin">96%</strong></div>
-            <div class="subscore-line"><span>Payload Hazard:</span><strong class="mono" id="sub-pay">92%</strong></div>
-            <div class="subscore-line"><span>RF Stealth Anomaly:</span><strong class="mono" id="sub-rf">88%</strong></div>
-            <div class="subscore-line"><span>Swarm Cohesion:</span><strong class="mono" id="sub-swm">95%</strong></div>
-          </div>
-        </div>
-
-        <!-- 3D Coordinates & Telemetry Grid -->
-        <div class="telemetry-grid">
-          <div class="telem-box">
-            <div class="telem-lbl">3D Distance (Slant)</div>
-            <div class="telem-val mono" id="telem-dist">412 m</div>
-          </div>
-          <div class="telem-box">
-            <div class="telem-lbl">Time-to-Impact (TTI)</div>
-            <div class="telem-val mono" style="color:var(--hostile-crimson);" id="telem-tti">3.8 s</div>
-          </div>
-          <div class="telem-box">
-            <div class="telem-lbl">Closing Velocity</div>
-            <div class="telem-val mono" id="telem-vel">26.2 m/s</div>
-          </div>
-          <div class="telem-box">
-            <div class="telem-lbl">Altitude (AGL / U)</div>
-            <div class="telem-val mono" id="telem-alt">142 m</div>
-          </div>
-        </div>
-
-        <!-- IMM Kinematic Mode Probabilities -->
-        <div class="imm-mode-box">
-          <div class="pod-header" style="height:auto; background:transparent; padding:0; border:none; margin-bottom:2px;">
-            <span>IMM-UKF 3D KINEMATICS</span>
-            <span class="wm mono">60-STEP FORECAST</span>
-          </div>
-          <div class="imm-bar-row">
-            <span>CV (Loiter/Recon):</span>
-            <div class="imm-prog-bg"><div class="imm-prog-fill" id="imm-bar-cv" style="width: 4%;"></div></div>
-            <span class="mono" id="imm-txt-cv">4%</span>
-          </div>
-          <div class="imm-bar-row">
-            <span>CTRV (Evasive Weave):</span>
-            <div class="imm-prog-bg"><div class="imm-prog-fill" id="imm-bar-ctrv" style="width: 14%;"></div></div>
-            <span class="mono" id="imm-txt-ctrv">14%</span>
-          </div>
-          <div class="imm-bar-row">
-            <span>CA_DIVE (Suicide Dive):</span>
-            <div class="imm-prog-bg"><div class="imm-prog-fill" id="imm-bar-dive" style="width: 82%; background:var(--hostile-crimson);"></div></div>
-            <span class="mono" id="imm-txt-dive" style="color:var(--hostile-crimson);">82%</span>
-          </div>
-        </div>
-
-        <!-- Dual Spectrograms: 128-Bin SDR RF + Micro-Doppler -->
-        <div class="spectrogram-row">
-          <div class="spec-box">
-            <div class="spec-title">128-BIN SDR SPECTRUM (ELRS)</div>
-            <canvas id="rf-spec-canvas" class="spec-canvas" width="160" height="70"></canvas>
-          </div>
-          <div class="spec-box">
-            <div class="spec-title">ROTOR MICRO-DOPPLER (180Hz)</div>
-            <canvas id="dop-spec-canvas" class="spec-canvas" width="160" height="70"></canvas>
-          </div>
-        </div>
-
-        <!-- Ground Impact Point & CEP -->
-        <div class="telem-box" style="border-color:rgba(255,42,84,0.4);">
-          <div class="telem-lbl">Projected Ground Impact & CEP</div>
-          <div class="mono" style="font-size:11px; color:var(--text-primary); margin-top:3px;" id="telem-cep">
-            IMPACT: E -120m, N +85m | CEP Radius: 4.2m
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ZONE E: FLOATING AUTONOMOUS KILL-CHAIN DOCK -->
-    <div id="zone-e-dock" class="hud-pod">
-      <div class="fiducial-tl"></div><div class="fiducial-tr"></div><div class="fiducial-bl"></div><div class="fiducial-br"></div>
-      
-      <!-- 6-Stage Kill-Chain Stepper -->
-      <div class="killchain-stepper">
-        <div class="kc-step" id="kc-1"><span class="kc-dot"></span>DETECT</div>
-        <span class="kc-arrow">&rarr;</span>
-        <div class="kc-step" id="kc-2"><span class="kc-dot"></span>TRACK</div>
-        <span class="kc-arrow">&rarr;</span>
-        <div class="kc-step" id="kc-3"><span class="kc-dot"></span>IDENTIFY</div>
-        <span class="kc-arrow">&rarr;</span>
-        <div class="kc-step" id="kc-4"><span class="kc-dot"></span>CUE_EFFECTOR</div>
-        <span class="kc-arrow">&rarr;</span>
-        <div class="kc-step active" id="kc-5"><span class="kc-dot"></span>ENGAGE</div>
-        <span class="kc-arrow">&rarr;</span>
-        <div class="kc-step" id="kc-6"><span class="kc-dot"></span>ASSESS_BDA</div>
-      </div>
-
-      <!-- Effector Action Grid (Hotkeys [1] [2] [3] [4] + Ceasefire) -->
-      <div class="effector-grid">
-        <div class="effector-btn" id="eff-jam" onclick="fireEffector('RF_JAMMER')">
-          <div class="eff-title"><span>[1] DIR RF JAMMER</span><span class="mono" style="color:var(--suspect-amber);">60°</span></div>
-          <div class="eff-sub">2.4G / 5.8G C2 Link Disrupt</div>
-          <div class="eff-status" id="st-jam">READY</div>
-        </div>
-
-        <div class="effector-btn" id="eff-spoof" onclick="fireEffector('GPS_SPOOF')">
-          <div class="eff-title"><span>[2] GNSS SPOOFER</span><span class="mono" style="color:var(--friendly-cyan);">L1/L2</span></div>
-          <div class="eff-sub">Synthesized Divert Orbit</div>
-          <div class="eff-status" id="st-spoof">READY</div>
-        </div>
-
-        <div class="effector-btn" id="eff-dazzler" onclick="fireEffector('OPTICAL_DAZZLER')">
-          <div class="eff-title"><span>[3] OPTICAL DAZZLER</span><span class="mono">532nm</span></div>
-          <div class="eff-sub">Sensor Saturation (LOS)</div>
-          <div class="eff-status" id="st-dazzler">READY</div>
-        </div>
-
-        <div class="effector-btn" id="eff-kinetic" onclick="fireEffector('KINETIC_INTERCEPT')">
-          <div class="eff-title"><span>[4] KINETIC LAUNCH</span><span class="mono" style="color:var(--hostile-crimson);">P_k .95</span></div>
-          <div class="eff-sub">Autonomous Interceptor</div>
-          <div class="eff-status" id="st-kinetic">ARMED</div>
-        </div>
-
-        <button class="ceasefire-pod-btn" onclick="fireCeasefire()">
-          <span style="font-size:12px;">CEASEFIRE</span>
-          <span class="mono" style="font-size:8px; opacity:0.8;">[SPACEBAR]</span>
-        </button>
-      </div>
-
-      <!-- Live Cryptographic SHA-256 Ledger Strip -->
-      <div class="audit-strip mono">
-        <span style="color:var(--nominal-emerald); font-weight:700;">SHA-256 LEDGER:</span>
-        <div class="audit-ticker" id="audit-ticker-txt">#8f3a...9c12 [GENESIS] Initialized root defense policy | #4b12...ef89 [IMM-UKF] 3D track correlated.</div>
-        <span id="audit-count-badge" class="badge badge-cyan">42 BLOCKS</span>
-      </div>
-    </div>
-
-    <!-- HINT TOOLTIP -->
-    <div class="controls-hint mono">
-      DRAG: PAN | WHEEL: ZOOM (200m-5000m) | SHIFT+DRAG: 3D TILT | HOTKEYS: [1]-[4] EFFECTORS, [SPACE] CEASEFIRE, [V] 3D/2D
-    </div>
-
   </div>
 
-  <script>
-    // --- 1. SPATIAL CAMERA & BATTLESPACE ENGINE ---
-    const bCanvas = document.getElementById('battlespace-canvas');
-    const bCtx = bCanvas.getContext('2d');
-    const tetherSvg = document.getElementById('tether-svg');
-    const leaderPath = document.getElementById('leader-path');
-    const leaderDotTgt = document.getElementById('leader-dot-tgt');
-    const leaderDotCard = document.getElementById('leader-dot-card');
+  <div class="top-center-controls">
+    <button class="hud-btn active" id="view3DBtn" onclick="setCameraPreset('3D')">3D DOME</button>
+    <button class="hud-btn" id="view2DBtn" onclick="setCameraPreset('2D')">2D PPI</button>
+    <button class="hud-btn" id="orbitBtn" onclick="toggleAutoOrbit()">AUTO-ORBIT: ON</button>
 
-    let camera = {
-      yaw: 0.58,          // ~33 degrees azimuth rotation
-      pitch: 0.78,        // ~45 degrees isometric tilt (0 in 2D Planar)
-      targetPitch: 0.78,
-      targetYaw: 0.58,
-      zoom: 1.0,          // Range multiplier
-      panX: 0,
-      panY: 0,
-      mode: '3D_ISOMETRIC'
-    };
+    <select id="scenarioSelect" class="hud-select" onchange="switchScenario(this.value)">
+      <option value="SWARM_SATURATION">SCENARIO: 6-UAV MULTI-AXIS SWARM</option>
+      <option value="FPV_TERMINAL_DIVE">SCENARIO: SUICIDE FPV TERMINAL DIVE</option>
+      <option value="RF_SILENT_STEALTH">SCENARIO: RF-SILENT AUTONOMOUS SWARM</option>
+      <option value="MIXED_AIRSPACE">SCENARIO: MIXED CIVILIAN + HOSTILE</option>
+    </select>
 
-    let isDragging = false;
-    let isRightDragging = false;
-    let dragStartX = 0, dragStartY = 0;
-    let selectedTrackId = 101;
-    let audioEnabled = true;
-    let autoEngage = true;
-    let radarSweepRad = 0;
-    let activeEffector = null;
-    let effectorEndTime = 0;
+    <button class="hud-btn" id="roeToggleBtn" onclick="toggleRoeMode()">
+      ROE: <span id="roeModeText" style="color:#00F0FF;font-weight:700;">MANUAL HITL</span>
+    </button>
 
-    // Resize Full-Bleed
-    function resizeCanvas() {
-      bCanvas.width = window.innerWidth;
-      bCanvas.height = window.innerHeight;
+    <button class="hud-btn" id="audioBtn" onclick="toggleAudioSynth()">AUDIO: MUTE</button>
+
+    <div class="defcon-banner">
+      <span class="pulse-crimson"></span>
+      <span id="defconBannerText">DEFCON 1 // CRITICAL INTRUSION</span>
+    </div>
+  </div>
+
+  <div class="top-telemetry-pills">
+    <span>BASE: <strong style="color:#F8FAFC;">37.7749°N, 122.4194°W</strong></span>
+    <span>SPLASHES: <strong id="splashCountTop" style="color:#10B981;">0</strong></span>
+    <span id="utcClock" style="color:#00F0FF;">00:00:00 UTC</span>
+  </div>
+</header>
+
+<!-- ZONE B: TOP-LEFT FLOATING EO/IR GIMBAL TARGETING POD -->
+<section class="hud-pod pod-optronic">
+  <div class="pod-header">
+    <div class="pod-title">
+      <span class="led-dot" style="background:#FF2A54;box-shadow:0 0 8px #FF2A54;"></span>
+      EO/IR GIMBAL SLAW // LOCKED FEED
+    </div>
+    <div class="shader-tabs">
+      <button class="shader-tab active" id="tabWH" onclick="setShader('WH')">W-HOT</button>
+      <button class="shader-tab" id="tabBH" onclick="setShader('BH')">B-HOT</button>
+      <button class="shader-tab" id="tabNVG" onclick="setShader('NVG')">SWIR</button>
+      <button class="shader-tab" id="tabEO" onclick="setShader('EO')">EO HD</button>
+    </div>
+  </div>
+  <div class="optronic-viewport">
+    <canvas id="optronicCanvas"></canvas>
+  </div>
+  <div class="optronic-bar">
+    <span>LRF: <strong id="lrfReadout" style="color:#00F0FF;">410.2m LOCKED</strong></span>
+    <span>YOLOv8x + IMM-UKF: <strong style="color:#10B981;">31.8 FPS</strong></span>
+  </div>
+</section>
+
+<!-- ZONE C: BOTTOM-LEFT FLOATING PRIORITIZED SWARM TRACK MATRIX -->
+<section class="hud-pod pod-swarm-queue">
+  <div class="pod-header">
+    <div class="pod-title">
+      <span class="led-dot"></span>
+      MULTI-SENSOR SWARM TRACK QUEUE
+    </div>
+    <span class="pod-tag" id="activeTrackBadge">6 ACTIVE</span>
+  </div>
+  <div class="track-list-scroll" id="swarmTrackList"></div>
+</section>
+
+<!-- ZONE D: RIGHT FLOATING TARGET DOSSIER & DUAL SPECTRUM POD -->
+<aside class="hud-pod pod-dossier" id="dossierPod">
+  <div class="pod-header">
+    <div class="pod-title">
+      <span class="led-dot" style="background:#FFB000;box-shadow:0 0 8px #FFB000;"></span>
+      AI THREAT DOSSIER &amp; SPECTRUM BAY
+    </div>
+    <span class="pod-tag" id="wtaConfidenceTag">Pk: 91.0%</span>
+  </div>
+  <div class="dossier-content">
+    <div class="dossier-hero">
+      <div>
+        <div class="hero-callsign" id="dCallsign">#101-ALPHA</div>
+        <div class="hero-class" id="dClassText">SUICIDE_DRONE // PAYLOAD ARMED</div>
+      </div>
+      <div class="threat-dial-box">
+        <div style="font-size:8.5px;color:var(--text-muted);">THREAT INDEX</div>
+        <div class="threat-big-num" id="dThreatIndex">92.4 / 100</div>
+      </div>
+    </div>
+
+    <div class="telemetry-matrix">
+      <div class="t-cell">
+        <div class="t-lbl">SLANT RANGE</div>
+        <div class="t-val" id="dRange">412.0 m</div>
+      </div>
+      <div class="t-cell">
+        <div class="t-lbl">BEARING / ALT</div>
+        <div class="t-val" id="dBearingAlt">046° NE / 145m</div>
+      </div>
+      <div class="t-cell">
+        <div class="t-lbl">CLOSING / TTI</div>
+        <div class="t-val" id="dClosingTti" style="color:#FF2A54;">28.4m/s | 14.5s</div>
+      </div>
+      <div class="t-cell">
+        <div class="t-lbl">GEOFENCE ZONE</div>
+        <div class="t-val" id="dZone" style="color:#FF2A54;">RED &lt;500m</div>
+      </div>
+      <div class="t-cell">
+        <div class="t-lbl">RCS / ROTOR</div>
+        <div class="t-val" id="dRcsRpm">-16.4dB / 14.8k</div>
+      </div>
+      <div class="t-cell">
+        <div class="t-lbl">RF PROTOCOL</div>
+        <div class="t-val" id="dProtocol" style="color:#00F0FF;">ELRS 2.4GHz</div>
+      </div>
+    </div>
+
+    <!-- EXPLAINABLE AI THREAT SUB-SCORES & IMM MODES -->
+    <div class="subscore-stack">
+      <div class="sub-row">
+        <span style="color:var(--text-dim);">KINEMATIC LETHALITY</span>
+        <div class="bar-bg"><div class="bar-fg" id="barKin" style="width:88%;"></div></div>
+        <span id="valKin" style="text-align:right;">88%</span>
+      </div>
+      <div class="sub-row">
+        <span style="color:var(--text-dim);">PAYLOAD HAZARD</span>
+        <div class="bar-bg"><div class="bar-fg" id="barPay" style="width:94%;"></div></div>
+        <span id="valPay" style="text-align:right;">94%</span>
+      </div>
+      <div class="sub-row">
+        <span style="color:var(--text-dim);">IMM TERMINAL DIVE</span>
+        <div class="bar-bg"><div class="bar-fg" id="barDive" style="width:72%;"></div></div>
+        <span id="valDive" style="text-align:right;">72%</span>
+      </div>
+    </div>
+
+    <!-- DUAL SPECTRUM WATERFALL & MICRO-DOPPLER BAY -->
+    <div class="spectrum-stack">
+      <div class="spec-box">
+        <div class="spec-head">
+          <span>SDR 2.4 / 5.8 GHz FFT WATERFALL</span>
+          <span id="specRssi" style="color:#00F0FF;">RSSI: -74.2 dBm</span>
+        </div>
+        <div class="spec-canvas-wrap"><canvas id="rfWaterfallCanvas"></canvas></div>
+      </div>
+      <div class="spec-box">
+        <div class="spec-head">
+          <span>3D RADAR MICRO-DOPPLER BLADE FLASH</span>
+          <span id="specRpm" style="color:#FFB000;">HARMONIC LOCK</span>
+        </div>
+        <div class="spec-canvas-wrap"><canvas id="microDopplerCanvas"></canvas></div>
+      </div>
+    </div>
+  </div>
+</aside>
+
+<!-- ZONE E: BOTTOM-CENTER KILL-CHAIN & EFFECTOR ACTION DOCK -->
+<footer class="hud-pod pod-effector-dock">
+  <div class="kill-chain-bar">
+    <div class="kc-step" id="kc1">1. DETECT</div>
+    <div class="kc-step" id="kc2">2. TRACK</div>
+    <div class="kc-step" id="kc3">3. IDENTIFY</div>
+    <div class="kc-step" id="kc4">4. CUE WTA</div>
+    <div class="kc-step" id="kc5">5. ENGAGE</div>
+    <div class="kc-step" id="kc6">6. BDA SPLASH</div>
+  </div>
+
+  <div class="dock-grid">
+    <button class="dock-card" id="dockJammer" onclick="triggerEffector('RF_JAMMER')">
+      <div class="dc-top">
+        <span style="color:#FFB000;">ECM // DIRECTIONAL</span>
+        <span class="hotkey-chip">[KEY 1]</span>
+      </div>
+      <div class="dc-title">RF JAMMER (2.4/5.8G)</div>
+      <div class="dc-state" id="stJammer">STANDBY // 2.8 kW</div>
+    </button>
+
+    <button class="dock-card" id="dockSpoofer" onclick="triggerEffector('GNSS_SPOOFER')">
+      <div class="dc-top">
+        <span style="color:#0EA5E9;">NAV // EPHEMERIS</span>
+        <span class="hotkey-chip">[KEY 2]</span>
+      </div>
+      <div class="dc-title">GNSS / GPS SPOOFER</div>
+      <div class="dc-state" id="stSpoofer">STANDBY // VECTOR</div>
+    </button>
+
+    <button class="dock-card" id="dockDazzler" onclick="triggerEffector('OPTICAL_DAZZLER')">
+      <div class="dc-top">
+        <span style="color:#A855F7;">DEW // 1064nm LASER</span>
+        <span class="hotkey-chip">[KEY 3]</span>
+      </div>
+      <div class="dc-title">OPTICAL SWIR DAZZLER</div>
+      <div class="dc-state" id="stDazzler">STANDBY // SEEKER</div>
+    </button>
+
+    <button class="dock-card" id="dockKinetic" onclick="triggerEffector('KINETIC_INTERCEPTOR')">
+      <div class="dc-top">
+        <span style="color:#FF2A54;">HARD-KILL // SILO</span>
+        <span class="hotkey-chip">[KEY 4]</span>
+      </div>
+      <div class="dc-title">KINETIC INTERCEPTOR</div>
+      <div class="dc-state" id="stKinetic">READY (6 SILOS)</div>
+    </button>
+
+    <button class="ceasefire-dock-btn" onclick="triggerCeasefire()">
+      <span>CEASEFIRE</span>
+      <span class="mono" style="font-size:8px;color:#6EE7B7;">[SPACEBAR]</span>
+    </button>
+  </div>
+
+  <div class="ledger-footer">
+    <span>WTA ROE RECOMMENDATION: <strong id="dockWtaText" style="color:#00F0FF;">DIRECTIONAL RF JAMMER + GNSS SPOOFER</strong></span>
+    <span id="ledgerTicker" style="color:#10B981;">SHA-256 AUDIT CHAIN: #0001 VERIFIED ✓</span>
+  </div>
+</footer>
+
+<script>
+  // =========================================================================
+  // 1. STATE, CAMERA ORBIT PARAMETERS & WEB AUDIO SYNTH
+  // =========================================================================
+  let state = null;
+  let shaderMode = 'WH';
+  let camYaw = -0.45;       // Horizontal azimuth angle (radians)
+  let camPitch = 0.92;      // Vertical tilt (0 = flat 2D PPI, 1.05 = 3D isometric)
+  let camZoom = 1.05;       // Zoom multiplier
+  let autoOrbit = true;
+  let isDragging = false;
+  let dragStartX = 0, dragStartY = 0;
+  let screenTrackMap = {};  // Stores projected 2D screen coords for click picking & tether lines
+  let rfWaterfallRows = [];
+  let frameCount = 0;
+
+  // Web Audio API Synthesizer for military C2 acoustic feedback
+  let audioCtx = null;
+  let audioEnabled = false;
+
+  function playTone(freq, durationMs, type = 'sine', gainVal = 0.06) {
+    if (!audioEnabled) return;
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+      gain.gain.setValueAtTime(gainVal, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationMs / 1000);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + durationMs / 1000);
+    } catch (e) {}
+  }
+
+  function toggleAudioSynth() {
+    audioEnabled = !audioEnabled;
+    document.getElementById('audioBtn').textContent = audioEnabled ? 'AUDIO: ACTIVE' : 'AUDIO: MUTE';
+    document.getElementById('audioBtn').classList.toggle('active', audioEnabled);
+    if (audioEnabled) playTone(880, 120, 'triangle');
+  }
+
+  function setCameraPreset(mode) {
+    if (mode === '2D') {
+      camPitch = 0.0;
+      autoOrbit = false;
+      document.getElementById('orbitBtn').textContent = 'AUTO-ORBIT: OFF';
+    } else {
+      camPitch = 0.94;
     }
-    window.addEventListener('resize', resizeCanvas);
-    resizeCanvas();
+    document.getElementById('view3DBtn').classList.toggle('active', mode === '3D');
+    document.getElementById('view2DBtn').classList.toggle('active', mode === '2D');
+  }
 
-    // Mouse Interactions for 3D Camera Pan, Tilt, and Zoom
+  function toggleAutoOrbit() {
+    autoOrbit = !autoOrbit;
+    document.getElementById('orbitBtn').textContent = autoOrbit ? 'AUTO-ORBIT: ON' : 'AUTO-ORBIT: OFF';
+  }
+
+  function setShader(mode) {
+    shaderMode = mode;
+    ['WH', 'BH', 'NVG', 'EO'].forEach(m => {
+      document.getElementById('tab' + m).classList.toggle('active', m === mode);
+    });
+  }
+
+  // =========================================================================
+  // 2. REST COMMAND ACTIONS & KEYBOARD HOTKEYS
+  // =========================================================================
+  async function selectTrack(targetId) {
+    if (state) state.selected_target_id = targetId;
+    playTone(1240, 70, 'sine');
+    await fetch('/api/v1/target/select', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({target_id: targetId})
+    });
+  }
+
+  async function triggerEffector(effector) {
+    playTone(520, 180, 'sawtooth', 0.08);
+    const targetId = state ? state.selected_target_id : null;
+    await fetch('/api/v1/countermeasures/engage', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({effector, target_id: targetId, operator: 'LATTICE_SPATIAL_C2'})
+    });
+  }
+
+  async function triggerCeasefire() {
+    playTone(340, 220, 'sine');
+    await fetch('/api/v1/countermeasures/disengage', {method: 'POST'});
+  }
+
+  async function switchScenario(scenario) {
+    await fetch('/api/v1/scenario', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scenario})
+    });
+  }
+
+  async function toggleRoeMode() {
+    const next = (state && state.roe_mode === 'AUTO_ENGAGE') ? 'MANUAL_HITL' : 'AUTO_ENGAGE';
+    await fetch('/api/v1/roe_mode', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({roe_mode: next})
+    });
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === '1') triggerEffector('RF_JAMMER');
+    else if (e.key === '2') triggerEffector('GNSS_SPOOFER');
+    else if (e.key === '3') triggerEffector('OPTICAL_DAZZLER');
+    else if (e.key === '4') triggerEffector('KINETIC_INTERCEPTOR');
+    else if (e.code === 'Space') { e.preventDefault(); triggerCeasefire(); }
+  });
+
+  // =========================================================================
+  // 3. 3D ISOMETRIC BATTLESPACE PROJECTION ENGINE
+  // =========================================================================
+  function project3D(eastM, northM, altM, w, h) {
+    const worldScale = (Math.min(w, h) * 0.42) / 1850.0 * camZoom;
+    const cosY = Math.cos(camYaw);
+    const sinY = Math.sin(camYaw);
+
+    // Rotate around vertical Up axis
+    const rx = eastM * cosY - northM * sinY;
+    const ry = eastM * sinY + northM * cosY;
+
+    // Tilt by camPitch
+    const cosP = Math.cos(camPitch);
+    const sinP = Math.sin(camPitch);
+    const yProjected = ry * cosP;
+    const zProjected = altM * sinP * 2.1; // Exaggerate vertical altitude relief for tactical clarity
+
+    // Perspective depth factor
+    const depth = 1.0 + (ry * sinP) / 5500.0;
+    const sx = (w * 0.50) + (rx * worldScale) / Math.max(0.4, depth);
+    const sy = (h * 0.47) - (yProjected * worldScale) / Math.max(0.4, depth) - (zProjected * worldScale);
+    return {x: sx, y: sy, depth};
+  }
+
+  function fitCanvas(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.floor(rect.width * dpr) || canvas.height !== Math.floor(rect.height * dpr)) {
+      canvas.width = Math.floor(rect.width * dpr);
+      canvas.height = Math.floor(rect.height * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return {ctx, w: rect.width, h: rect.height};
+  }
+
+  // Mouse Orbit, Tilt, Zoom & Track Clicking on the Full-Bleed Canvas
+  document.addEventListener('DOMContentLoaded', () => {
+    const bCanvas = document.getElementById('battlespaceCanvas');
+
     bCanvas.addEventListener('mousedown', (e) => {
       isDragging = true;
       dragStartX = e.clientX;
       dragStartY = e.clientY;
-      if (e.button === 2 || e.shiftKey) {
-        isRightDragging = true;
-      }
     });
 
     window.addEventListener('mousemove', (e) => {
@@ -1051,842 +2023,617 @@ LATTICE_SPATIAL_OS_HTML = """<!DOCTYPE html>
       const dy = e.clientY - dragStartY;
       dragStartX = e.clientX;
       dragStartY = e.clientY;
-
-      if (isRightDragging || (e.buttons === 2) || e.shiftKey) {
-        // Tilt and Rotate
-        camera.targetPitch = Math.max(0.0, Math.min(1.15, camera.targetPitch - dy * 0.005));
-        camera.targetYaw += dx * 0.006;
-      } else {
-        // Pan
-        camera.panX += dx;
-        camera.panY += dy;
-      }
+      camYaw += dx * 0.0055;
+      camPitch = Math.max(0.0, Math.min(1.18, camPitch + dy * 0.0045));
     });
 
-    window.addEventListener('mouseup', () => {
+    window.addEventListener('mouseup', (e) => {
+      if (!isDragging) return;
       isDragging = false;
-      isRightDragging = false;
     });
-
-    bCanvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
     bCanvas.addEventListener('wheel', (e) => {
       e.preventDefault();
-      const zoomFactor = e.deltaY > 0 ? 0.90 : 1.11;
-      camera.zoom = Math.max(0.35, Math.min(3.8, camera.zoom * zoomFactor));
-    }, { passive: false });
+      camZoom = Math.max(0.55, Math.min(2.4, camZoom - e.deltaY * 0.0008));
+    }, {passive: false});
 
-    // 3D Projection Matrix to Screen Coordinates
-    function project3D(E, N, U, w, h) {
-      const cx = w / 2 + camera.panX;
-      const cy = h / 2 + camera.panY;
-      const baseScale = (Math.min(w, h) / 7200) * camera.zoom;
+    bCanvas.addEventListener('click', (e) => {
+      let closestId = null;
+      let minDist = 30;
+      Object.entries(screenTrackMap).forEach(([tid, pt]) => {
+        const d = Math.hypot(e.clientX - pt.x, e.clientY - pt.y);
+        if (d < minDist) {
+          minDist = d;
+          closestId = tid;
+        }
+      });
+      if (closestId) selectTrack(closestId);
+    });
+  });
 
-      const effYaw = (camera.mode === '2D_PLANAR') ? 0 : camera.yaw;
-      const effPitch = (camera.mode === '2D_PLANAR') ? 0 : camera.pitch;
+  // =========================================================================
+  // 4. RENDER FULL-BLEED 3D SPATIAL BATTLESPACE
+  // =========================================================================
+  function renderBattlespace3D() {
+    const canvas = document.getElementById('battlespaceCanvas');
+    const {ctx, w, h} = fitCanvas(canvas);
 
-      const rotX = E * Math.cos(effYaw) - N * Math.sin(effYaw);
-      const rotY = E * Math.sin(effYaw) + N * Math.cos(effYaw);
-
-      const sx = cx + rotX * baseScale;
-      const sy = cy - (rotY * Math.cos(effPitch) + U * Math.sin(effPitch)) * baseScale;
-      return { x: sx, y: sy };
+    if (autoOrbit && !isDragging && camPitch > 0.1) {
+      camYaw += 0.0012;
     }
 
-    // --- 2. 8-DRONE MULTI-TARGET SWARM STATE ---
-    let swarmTracks = [
-      { id: 101, class: "SUICIDE FPV", enu: [-180, 420, 160], vel: [12, -24, -14], tti: 3.8, threat: 94.2, level: "CRITICAL", proto: "ELRS 900MHz", rpm: 24000, history: [] },
-      { id: 102, class: "SUICIDE FPV", enu: [340, 480, 210], vel: [-16, -22, -12], tti: 5.6, threat: 91.5, level: "HIGH", proto: "OcuSync-3", rpm: 23500, history: [] },
-      { id: 103, class: "RECON QUAD", enu: [-480, 780, 360], vel: [5, -8, -2], tti: 14.8, threat: 64.0, level: "ELEVATED", proto: "TBS Crossfire", rpm: 14500, history: [] },
-      { id: 104, class: "CIVILIAN FLYBY", enu: [620, 310, 95], vel: [-7, 3, 0], tti: 99.0, threat: 14.5, level: "SAFE", proto: "WiFi 2.4GHz", rpm: 8800, history: [] },
-      { id: 105, class: "SUICIDE FPV", enu: [-90, 280, 120], vel: [8, -28, -16], tti: 2.9, threat: 96.0, level: "CRITICAL", proto: "ELRS 2.4GHz", rpm: 25000, history: [] },
-      { id: 106, class: "DECOY DRONE", enu: [520, 650, 280], vel: [-18, -12, -4], tti: 18.2, threat: 52.0, level: "ELEVATED", proto: "Dark / RF-Silent", rpm: 16000, history: [] },
-      { id: 107, class: "RECON SPOTTER", enu: [150, 950, 420], vel: [-3, -6, -1], tti: 28.0, threat: 58.5, level: "ELEVATED", proto: "MAVLink 915MHz", rpm: 13000, history: [] },
-      { id: 108, class: "AUTONOMOUS MUNITION", enu: [260, 380, 190], vel: [-15, -26, -18], tti: 3.4, threat: 98.2, level: "CRITICAL", proto: "Optical Nav (Dark)", rpm: 24500, history: [] }
+    ctx.fillStyle = '#03060C';
+    ctx.fillRect(0, 0, w, h);
+
+    // 1. Isometric Ground Metric Wireframe Grid (-2000m to +2000m)
+    ctx.strokeStyle = 'rgba(30, 41, 59, 0.36)';
+    ctx.lineWidth = 1;
+    const step = 400;
+    const bound = 2000;
+    ctx.beginPath();
+    for (let g = -bound; g <= bound; g += step) {
+      const p1 = project3D(g, -bound, 0, w, h);
+      const p2 = project3D(g, bound, 0, w, h);
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+
+      const p3 = project3D(-bound, g, 0, w, h);
+      const p4 = project3D(bound, g, 0, w, h);
+      ctx.moveTo(p3.x, p3.y);
+      ctx.lineTo(p4.x, p4.y);
+    }
+    ctx.stroke();
+
+    // 2. Concentric Geodesic Defense Rings & 3D Wireframe Domes
+    const zones = [
+      {r: 500, color: 'rgba(255, 42, 84, 0.65)', dome: 'rgba(255, 42, 84, 0.12)', label: '500m RED KILLZONE'},
+      {r: 1500, color: 'rgba(255, 176, 0, 0.45)', dome: 'rgba(255, 176, 0, 0.05)', label: '1500m AMBER WARNING'},
+      {r: 2200, color: 'rgba(0, 240, 255, 0.30)', dome: null, label: 'EARLY DETECTION PERIMETER'}
     ];
 
-    let blueInterceptors = [];
-
-    // --- 3. WEB AUDIO API SYNTHESIZER ---
-    let audioCtx = null;
-    function initAudio() {
-      if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    zones.forEach(z => {
+      ctx.strokeStyle = z.color;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for (let deg = 0; deg <= 360; deg += 5) {
+        const rad = (deg * Math.PI) / 180;
+        const pt = project3D(z.r * Math.sin(rad), z.r * Math.cos(rad), 0, w, h);
+        if (deg === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
       }
-    }
-    function playBeep(freq, duration, type='sine', gainVal=0.08) {
-      if (!audioEnabled) return;
-      try {
-        initAudio();
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = type;
-        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
-        gain.gain.setValueAtTime(gainVal, audioCtx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start();
-        osc.stop(audioCtx.currentTime + duration);
-      } catch(e) {}
-    }
-    function playLockChime() {
-      playBeep(1800, 0.08, 'sine', 0.1);
-      setTimeout(() => playBeep(2400, 0.12, 'sine', 0.1), 90);
-    }
-    function playRadarTick() {
-      playBeep(880, 0.03, 'triangle', 0.02);
-    }
-    function playCautionAlarm() {
-      playBeep(650, 0.15, 'sawtooth', 0.12);
-    }
+      ctx.stroke();
 
-    // --- 4. RENDER 3D SPATIAL BATTLESPACE ---
-    function renderBattlespaceOS() {
-      const w = bCanvas.width, h = bCanvas.height;
-
-      // Smooth camera interpolation
-      camera.pitch += (camera.targetPitch - camera.pitch) * 0.12;
-      camera.yaw += (camera.targetYaw - camera.yaw) * 0.12;
-
-      // 1. Deep Void Canvas
-      bCtx.fillStyle = '#04070B';
-      bCtx.fillRect(0, 0, w, h);
-
-      // 2. Isometric Ground Topographic Meter Grid
-      bCtx.lineWidth = 1;
-      const gridSize = 500;
-      const gridExtent = 4000;
-      bCtx.strokeStyle = 'rgba(15, 23, 42, 0.7)';
-      for (let x = -gridExtent; x <= gridExtent; x += gridSize) {
-        const p1 = project3D(x, -gridExtent, 0, w, h);
-        const p2 = project3D(x, gridExtent, 0, w, h);
-        bCtx.beginPath();
-        bCtx.moveTo(p1.x, p1.y);
-        bCtx.lineTo(p2.x, p2.y);
-        bCtx.stroke();
-      }
-      for (let y = -gridExtent; y <= gridExtent; y += gridSize) {
-        const p1 = project3D(-gridExtent, y, 0, w, h);
-        const p2 = project3D(gridExtent, y, 0, w, h);
-        bCtx.beginPath();
-        bCtx.moveTo(p1.x, p1.y);
-        bCtx.lineTo(p2.x, p2.y);
-        bCtx.stroke();
-      }
-
-      // 3. Geodesic Defense Domes (Ground Rings + 3D Arches)
-      const domes = [
-        { r: 500, col: 'rgba(255, 42, 84, 0.65)', label: '500m CRIMSON KILLZONE' },
-        { r: 1500, col: 'rgba(255, 176, 0, 0.50)', label: '1500m AMBER WARNING' },
-        { r: 3500, col: 'rgba(0, 240, 255, 0.40)', label: '3500m CYAN DETECTION' }
-      ];
-
-      for (const d of domes) {
-        // Ground circle
-        bCtx.strokeStyle = d.col;
-        bCtx.lineWidth = 1.2;
-        bCtx.beginPath();
-        const steps = 64;
-        for (let i = 0; i <= steps; i++) {
-          const ang = (i / steps) * Math.PI * 2;
-          const gx = Math.cos(ang) * d.r;
-          const gy = Math.sin(ang) * d.r;
-          const pt = project3D(gx, gy, 0, w, h);
-          if (i === 0) bCtx.moveTo(pt.x, pt.y); else bCtx.lineTo(pt.x, pt.y);
-        }
-        bCtx.stroke();
-
-        // 3D Geodesic Hemispherical Arches (when in 3D mode)
-        if (camera.mode === '3D_ISOMETRIC' && camera.pitch > 0.15) {
-          bCtx.strokeStyle = d.col.replace(/[\d\.]+\)$/, '0.18)');
-          bCtx.lineWidth = 1;
-          for (const az of [0, Math.PI / 4, Math.PI / 2, 3 * Math.PI / 4]) {
-            bCtx.beginPath();
-            for (let j = 0; j <= 32; j++) {
-              const el = (j / 32) * Math.PI;
-              const ax = Math.cos(az) * Math.cos(el) * d.r;
-              const ay = Math.sin(az) * Math.cos(el) * d.r;
-              const az_u = Math.sin(el) * d.r;
-              const pt = project3D(ax, ay, az_u, w, h);
-              if (j === 0) bCtx.moveTo(pt.x, pt.y); else bCtx.lineTo(pt.x, pt.y);
-            }
-            bCtx.stroke();
+      // Draw 3D Hemispherical Wireframe Dome Ribs on the 500m Killzone
+      if (z.r === 500 && camPitch > 0.15) {
+        ctx.strokeStyle = 'rgba(255, 42, 84, 0.16)';
+        ctx.lineWidth = 1;
+        for (let az = 0; az < 180; az += 45) {
+          const azRad = (az * Math.PI) / 180;
+          ctx.beginPath();
+          for (let el = 0; el <= 180; el += 10) {
+            const elRad = (el * Math.PI) / 180;
+            const horiz = z.r * Math.cos(elRad);
+            const up = z.r * Math.sin(elRad) * 0.45;
+            const pt = project3D(horiz * Math.sin(azRad), horiz * Math.cos(azRad), up, w, h);
+            if (el === 0) ctx.moveTo(pt.x, pt.y);
+            else ctx.lineTo(pt.x, pt.y);
           }
-        }
-
-        // Perimeter Label
-        const lblPt = project3D(0, d.r, 0, w, h);
-        bCtx.fillStyle = d.col;
-        bCtx.font = '10px JetBrains Mono';
-        bCtx.fillText(d.label, lblPt.x + 8, lblPt.y - 4);
-      }
-
-      // 4. Rotating AESA Radar Phased Array Sweep
-      radarSweepRad = (radarSweepRad + 0.035) % (Math.PI * 2);
-      const sweepMaxR = 3500;
-      const sweepX = Math.cos(radarSweepRad) * sweepMaxR;
-      const sweepY = Math.sin(radarSweepRad) * sweepMaxR;
-      const basePt = project3D(0, 0, 0, w, h);
-      const sweepPt = project3D(sweepX, sweepY, 0, w, h);
-
-      bCtx.strokeStyle = 'rgba(0, 240, 255, 0.55)';
-      bCtx.lineWidth = 1.5;
-      bCtx.beginPath();
-      bCtx.moveTo(basePt.x, basePt.y);
-      bCtx.lineTo(sweepPt.x, sweepPt.y);
-      bCtx.stroke();
-
-      // Base HQ Citadel Mark at Center
-      bCtx.fillStyle = '#00F0FF';
-      bCtx.fillRect(basePt.x - 5, basePt.y - 5, 10, 10);
-      bCtx.strokeStyle = '#FFFFFF';
-      bCtx.strokeRect(basePt.x - 7, basePt.y - 7, 14, 14);
-      bCtx.font = '10px JetBrains Mono';
-      bCtx.fillText("BASE HQ // 37.7749° N, 122.4194° W", basePt.x + 12, basePt.y + 4);
-
-      // 5. Volumetric Sensor & Effector Cones Originating from Base HQ
-      const lockedTarget = swarmTracks.find(t => t.id === selectedTrackId);
-      if (lockedTarget) {
-        const tAir = project3D(lockedTarget.enu[0], lockedTarget.enu[1], lockedTarget.enu[2], w, h);
-
-        // Volumetric EO/IR Viewing Frustum (Translucent Cyan Pyramidal Cone)
-        bCtx.fillStyle = 'rgba(0, 240, 255, 0.06)';
-        bCtx.strokeStyle = 'rgba(0, 240, 255, 0.35)';
-        bCtx.lineWidth = 1;
-        bCtx.beginPath();
-        bCtx.moveTo(basePt.x, basePt.y);
-        bCtx.lineTo(tAir.x - 35, tAir.y - 25);
-        bCtx.lineTo(tAir.x + 35, tAir.y - 25);
-        bCtx.closePath();
-        bCtx.fill();
-        bCtx.stroke();
-
-        bCtx.beginPath();
-        bCtx.moveTo(basePt.x, basePt.y);
-        bCtx.lineTo(tAir.x + 35, tAir.y + 25);
-        bCtx.lineTo(tAir.x - 35, tAir.y + 25);
-        bCtx.closePath();
-        bCtx.fill();
-        bCtx.stroke();
-
-        // Directional RF Jammer Saturation Cone (When active)
-        if (activeEffector === 'RF_JAMMER' && Date.now() < effectorEndTime) {
-          bCtx.fillStyle = 'rgba(255, 176, 0, 0.15)';
-          bCtx.strokeStyle = 'rgba(255, 176, 0, 0.7)';
-          bCtx.beginPath();
-          bCtx.moveTo(basePt.x, basePt.y);
-          const jamAng = Math.atan2(lockedTarget.enu[1], lockedTarget.enu[0]);
-          const coneL = 2200;
-          const pCone1 = project3D(Math.cos(jamAng - 0.52) * coneL, Math.sin(jamAng - 0.52) * coneL, 0, w, h);
-          const pCone2 = project3D(Math.cos(jamAng + 0.52) * coneL, Math.sin(jamAng + 0.52) * coneL, 0, w, h);
-          bCtx.lineTo(pCone1.x, pCone1.y);
-          bCtx.lineTo(pCone2.x, pCone2.y);
-          bCtx.closePath();
-          bCtx.fill();
-          bCtx.stroke();
-        }
-
-        // Optical Dazzler Laser Line
-        if (activeEffector === 'OPTICAL_DAZZLER' && Date.now() < effectorEndTime) {
-          bCtx.strokeStyle = '#10B981';
-          bCtx.lineWidth = 3;
-          bCtx.shadowColor = '#10B981';
-          bCtx.shadowBlur = 12;
-          bCtx.beginPath();
-          bCtx.moveTo(basePt.x, basePt.y);
-          bCtx.lineTo(tAir.x, tAir.y);
-          bCtx.stroke();
-          bCtx.shadowBlur = 0;
+          ctx.stroke();
         }
       }
 
-      // 6. Render Swarm Aerial Tracks with 3D Elevation Stalks & IMM-UKF Trajectories
-      let lowestTTI = 999;
-      for (const trk of swarmTracks) {
-        // Physics update
-        trk.enu[0] += trk.vel[0] * 0.04;
-        trk.enu[1] += trk.vel[1] * 0.04;
-        trk.enu[2] += trk.vel[2] * 0.04;
-        if (trk.enu[2] < 30) trk.enu[2] = 30; // Min AGL
-
-        // Record history trail
-        if (!trk.history) trk.history = [];
-        if (Math.random() < 0.25) {
-          trk.history.push([...trk.enu]);
-          if (trk.history.length > 25) trk.history.shift();
-        }
-
-        const dist = Math.hypot(trk.enu[0], trk.enu[1], trk.enu[2]);
-        trk.tti = Math.max(0.5, (dist / Math.max(12, Math.hypot(...trk.vel)))).toFixed(1);
-        if (trk.tti < lowestTTI) lowestTTI = trk.tti;
-
-        const isLocked = (trk.id === selectedTrackId);
-        const col = (trk.level === 'CRITICAL') ? '#FF2A54' : (trk.level === 'HIGH' ? '#FF6B00' : (trk.level === 'ELEVATED' ? '#FFB000' : '#10B981'));
-
-        const pAir = project3D(trk.enu[0], trk.enu[1], trk.enu[2], w, h);
-        const pGnd = project3D(trk.enu[0], trk.enu[1], 0, w, h);
-
-        // A. 3D Vertical Elevation Stalk (Drop-Line)
-        bCtx.strokeStyle = 'rgba(148, 163, 184, 0.45)';
-        bCtx.setLineDash([3, 3]);
-        bCtx.lineWidth = 1;
-        bCtx.beginPath();
-        bCtx.moveTo(pAir.x, pAir.y);
-        bCtx.lineTo(pGnd.x, pGnd.y);
-        bCtx.stroke();
-        bCtx.setLineDash([]);
-
-        // Ground shadow footprint ellipse
-        bCtx.strokeStyle = col;
-        bCtx.fillStyle = col.replace(/#/, 'rgba(') + ', 0.15)';
-        bCtx.beginPath();
-        bCtx.ellipse(pGnd.x, pGnd.y, 8, 4, 0, 0, Math.PI * 2);
-        bCtx.fill();
-        bCtx.stroke();
-
-        // B. Translucent Historical Flight Curtain
-        if (trk.history.length > 1) {
-          bCtx.fillStyle = 'rgba(255, 176, 0, 0.08)';
-          bCtx.strokeStyle = 'rgba(255, 176, 0, 0.35)';
-          bCtx.beginPath();
-          for (let k = 0; k < trk.history.length; k++) {
-            const hPt = project3D(trk.history[k][0], trk.history[k][1], trk.history[k][2], w, h);
-            if (k === 0) bCtx.moveTo(hPt.x, hPt.y); else bCtx.lineTo(hPt.x, hPt.y);
-          }
-          bCtx.stroke();
-        }
-
-        // C. Forward 3D IMM-UKF Predicted Trajectory Tube & Uncertainty Ellipse
-        if (isLocked) {
-          bCtx.strokeStyle = '#00F0FF';
-          bCtx.lineWidth = 2;
-          bCtx.beginPath();
-          let prevPred = pAir;
-          for (let s = 1; s <= 15; s++) {
-            const predE = trk.enu[0] + trk.vel[0] * (s * 0.4);
-            const predN = trk.enu[1] + trk.vel[1] * (s * 0.4);
-            const predU = Math.max(0, trk.enu[2] + trk.vel[2] * (s * 0.4));
-            const predPt = project3D(predE, predN, predU, w, h);
-            bCtx.moveTo(prevPred.x, prevPred.y);
-            bCtx.lineTo(predPt.x, predPt.y);
-            prevPred = predPt;
-
-            // 95% Covariance Uncertainty Ellipse at forward intervals
-            if (s % 5 === 0) {
-              bCtx.ellipse(predPt.x, predPt.y, s * 1.5, s * 0.9, 0, 0, Math.PI * 2);
-            }
-          }
-          bCtx.stroke();
-
-          // Update SVG Leader Tether Line to Zone D Dossier
-          updateTetherLeader(pAir.x, pAir.y);
-        }
-
-        // D. 3D Airframe NATO MIL-STD-2525D Symbology (Diamond / Circle)
-        bCtx.strokeStyle = col;
-        bCtx.lineWidth = isLocked ? 2.5 : 1.5;
-        bCtx.beginPath();
-        // Hostile Diamond
-        bCtx.moveTo(pAir.x, pAir.y - 8);
-        bCtx.lineTo(pAir.x + 8, pAir.y);
-        bCtx.lineTo(pAir.x, pAir.y + 8);
-        bCtx.lineTo(pAir.x - 8, pAir.y);
-        bCtx.closePath();
-        bCtx.stroke();
-
-        if (isLocked) {
-          bCtx.strokeStyle = '#00F0FF';
-          bCtx.strokeRect(pAir.x - 12, pAir.y - 12, 24, 24);
-        }
-
-        // Callout Tag
-        bCtx.fillStyle = '#F8FAFC';
-        bCtx.font = '10px JetBrains Mono';
-        bCtx.fillText(`TRK-${trk.id} [${trk.class.split(' ')[0]}]`, pAir.x + 12, pAir.y - 4);
-        bCtx.fillStyle = col;
-        bCtx.fillText(`ALT: ${Math.round(trk.enu[2])}m | TTI ${trk.tti}s`, pAir.x + 12, pAir.y + 8);
-      }
-
-      // 7. Render Friendly Blue Kinetic Interceptors
-      for (let bIdx = blueInterceptors.length - 1; bIdx >= 0; bIdx--) {
-        const b = blueInterceptors[bIdx];
-        b.progress += 0.05;
-        const bAir = project3D(b.x, b.y, b.z, w, h);
-        bCtx.fillStyle = '#00F0FF';
-        bCtx.fillRect(bAir.x - 4, bAir.y - 4, 8, 8);
-        bCtx.font = '9px JetBrains Mono';
-        bCtx.fillText("BLUE-INT-ALPHA", bAir.x + 8, bAir.y + 3);
-
-        // Move towards target
-        b.x += (b.targetEnu[0] - b.x) * 0.12;
-        b.y += (b.targetEnu[1] - b.y) * 0.12;
-        b.z += (b.targetEnu[2] - b.z) * 0.12;
-
-        if (b.progress >= 1.0 || Math.hypot(b.targetEnu[0] - b.x, b.targetEnu[1] - b.y) < 15) {
-          // SPLASH CONFIRMED BDA
-          bCtx.strokeStyle = '#FF2A54';
-          bCtx.lineWidth = 3;
-          bCtx.beginPath();
-          bCtx.arc(bAir.x, bAir.y, 25, 0, Math.PI * 2);
-          bCtx.stroke();
-          appendAuditLedger(`BDA: SPLASH CONFIRMED on TRK #${b.targetId}`);
-          blueInterceptors.splice(bIdx, 1);
-        }
-      }
-
-      requestAnimationFrame(renderBattlespaceOS);
-    }
-
-    // --- 5. DYNAMIC LEADER TETHER TO ZONE D ---
-    function updateTetherLeader(tx, ty) {
-      const zoneDPod = document.getElementById('zone-d-pod');
-      if (!zoneDPod) return;
-      const rect = zoneDPod.getBoundingClientRect();
-      const cardX = rect.left;
-      const cardY = rect.top + 36;
-
-      const midX = tx + (cardX - tx) * 0.55;
-      const pathD = `M ${tx} ${ty} L ${midX} ${ty} L ${midX} ${cardY} L ${cardX} ${cardY}`;
-      leaderPath.setAttribute('d', pathD);
-      leaderDotTgt.setAttribute('cx', tx);
-      leaderDotTgt.setAttribute('cy', ty);
-      leaderDotCard.setAttribute('cx', cardX);
-      leaderDotCard.setAttribute('cy', cardY);
-    }
-
-    // --- 6. OPTRONIC EO/IR GIMBAL VIEWPORT (ZONE B) ---
-    const optCanvas = document.getElementById('optronic-canvas');
-    const optCtx = optCanvas.getContext('2d');
-    const pipCanvas = document.getElementById('pip-canvas');
-    const pipCtx = pipCanvas.getContext('2d');
-    let currentShaderMode = 'EO_DAYLIGHT';
-
-    function renderOptronicViewport() {
-      const w = optCanvas.width, h = optCanvas.height;
-      const locked = swarmTracks.find(t => t.id === selectedTrackId) || swarmTracks[0];
-
-      // Shader Background
-      if (currentShaderMode === 'EO_DAYLIGHT') {
-        const grad = optCtx.createLinearGradient(0, 0, 0, h);
-        grad.addColorStop(0, '#0a101d');
-        grad.addColorStop(0.68, '#182436');
-        grad.addColorStop(1, '#0e1726');
-        optCtx.fillStyle = grad;
-        optCtx.fillRect(0, 0, w, h);
-      } else if (currentShaderMode === 'FLIR_WHITE_HOT') {
-        optCtx.fillStyle = '#0d1117';
-        optCtx.fillRect(0, 0, w, h);
-      } else if (currentShaderMode === 'FLIR_BLACK_HOT') {
-        optCtx.fillStyle = '#b8c0cc';
-        optCtx.fillRect(0, 0, w, h);
-      } else { // SWIR Night Vision
-        optCtx.fillStyle = '#04180d';
-        optCtx.fillRect(0, 0, w, h);
-      }
-
-      // Artificial Horizon & Roll/Pitch Ladder
-      const cx = w / 2, cy = h / 2;
-      optCtx.strokeStyle = (currentShaderMode === 'FLIR_BLACK_HOT') ? '#1e293b' : 'rgba(0, 240, 255, 0.4)';
-      optCtx.lineWidth = 1;
-      optCtx.beginPath();
-      optCtx.moveTo(cx - 50, cy); optCtx.lineTo(cx - 15, cy);
-      optCtx.moveTo(cx + 15, cy); optCtx.lineTo(cx + 50, cy);
-      optCtx.stroke();
-
-      // Pitch rungs
-      optCtx.beginPath();
-      optCtx.moveTo(cx - 30, cy - 25); optCtx.lineTo(cx + 30, cy - 25);
-      optCtx.moveTo(cx - 30, cy + 25); optCtx.lineTo(cx + 30, cy + 25);
-      optCtx.stroke();
-
-      // Heading tape
-      optCtx.strokeRect(cx - 60, 10, 120, 16);
-      optCtx.fillStyle = (currentShaderMode === 'FLIR_BLACK_HOT') ? '#000' : '#00F0FF';
-      optCtx.font = '10px JetBrains Mono';
-      optCtx.fillText("048° NNE // EL +14°", cx - 48, 22);
-
-      // Render Targeted UAV in Gimbal Viewport
-      const uavColor = (currentShaderMode === 'FLIR_WHITE_HOT') ? '#FFFFFF' : (currentShaderMode === 'FLIR_BLACK_HOT' ? '#000000' : (currentShaderMode === 'SWIR_NIGHT_VISION' ? '#10B981' : '#F8FAFC'));
-      optCtx.fillStyle = uavColor;
-      optCtx.beginPath();
-      optCtx.arc(cx, cy, 6, 0, Math.PI * 2);
-      optCtx.fill();
-
-      // Quad arms & blurred rotors
-      optCtx.strokeStyle = uavColor;
-      optCtx.lineWidth = 2;
-      optCtx.beginPath();
-      optCtx.moveTo(cx - 18, cy - 10); optCtx.lineTo(cx + 18, cy + 10);
-      optCtx.moveTo(cx - 18, cy + 10); optCtx.lineTo(cx + 18, cy - 10);
-      optCtx.stroke();
-
-      // Precision Corner Brackets
-      const bw = 38, bh = 32;
-      optCtx.strokeStyle = '#FF2A54';
-      optCtx.lineWidth = 1.5;
-      optCtx.beginPath();
-      optCtx.moveTo(cx - bw, cy - bh + 8); optCtx.lineTo(cx - bw, cy - bh); optCtx.lineTo(cx - bw + 8, cy - bh);
-      optCtx.moveTo(cx + bw - 8, cy - bh); optCtx.lineTo(cx + bw, cy - bh); optCtx.lineTo(cx + bw, cy - bh + 8);
-      optCtx.moveTo(cx - bw, cy + bh - 8); optCtx.lineTo(cx - bw, cy + bh); optCtx.lineTo(cx - bw + 8, cy + bh);
-      optCtx.moveTo(cx + bw - 8, cy + bh); optCtx.lineTo(cx + bw, cy + bh); optCtx.lineTo(cx + bw, cy + bh - 8);
-      optCtx.stroke();
-
-      // Lead-computing pipper
-      optCtx.strokeStyle = '#00F0FF';
-      optCtx.beginPath();
-      optCtx.arc(cx + 16, cy - 12, 10, 0, Math.PI * 2);
-      optCtx.moveTo(cx + 16 - 5, cy - 12); optCtx.lineTo(cx + 16 + 5, cy - 12);
-      optCtx.moveTo(cx + 16, cy - 12 - 5); optCtx.lineTo(cx + 16, cy - 12 + 5);
-      optCtx.stroke();
-
-      // Telemetry tags
-      optCtx.fillStyle = '#00F0FF';
-      optCtx.font = '10px JetBrains Mono';
-      optCtx.fillText(`TRK-${locked.id} [${locked.class.split(' ')[0]}]`, cx - bw, cy - bh - 6);
-      optCtx.fillStyle = '#FF2A54';
-      optCtx.fillText(`TTI: ${locked.tti}s | RNG: ${Math.round(Math.hypot(...locked.enu))}m`, cx - bw, cy + bh + 14);
-
-      // Render PiP Loupe (Zoom on payload)
-      pipCtx.fillStyle = (currentShaderMode === 'FLIR_BLACK_HOT') ? '#b8c0cc' : '#0B101B';
-      pipCtx.fillRect(0, 0, pipCanvas.width, pipCanvas.height);
-      const pcx = pipCanvas.width / 2, pcy = pipCanvas.height / 2;
-      pipCtx.fillStyle = (currentShaderMode === 'FLIR_WHITE_HOT') ? '#FFFFFF' : '#CBD5E1';
-      pipCtx.beginPath();
-      pipCtx.arc(pcx, pcy - 8, 14, 0, Math.PI * 2);
-      pipCtx.fill();
-      // Payload munition cylinder
-      pipCtx.fillStyle = '#FF2A54';
-      pipCtx.fillRect(pcx - 8, pcy + 6, 16, 20);
-      pipCtx.fillStyle = '#00F0FF';
-      pipCtx.font = '8px JetBrains Mono';
-      pipCtx.fillText("SHAPED CHG", 4, pipCanvas.height - 4);
-
-      requestAnimationFrame(renderOptronicViewport);
-    }
-
-    // --- 7. DUAL SPECTROGRAMS (ZONE D) ---
-    const rfSpecCanvas = document.getElementById('rf-spec-canvas');
-    const rfCtx = rfSpecCanvas.getContext('2d');
-    const dopSpecCanvas = document.getElementById('dop-spec-canvas');
-    const dopCtx = dopSpecCanvas.getContext('2d');
-
-    function renderSpectrograms() {
-      // 128-bin RF PSD slice
-      const rw = rfSpecCanvas.width, rh = rfSpecCanvas.height;
-      rfCtx.fillStyle = '#020408';
-      rfCtx.fillRect(0, 0, rw, rh);
-      rfCtx.strokeStyle = '#FFB000';
-      rfCtx.lineWidth = 1;
-      rfCtx.beginPath();
-      for (let i = 0; i < 128; i++) {
-        const x = (i / 128) * rw;
-        const db = Math.sin(i * 0.1) * 12 + Math.random() * 8 + (i > 50 && i < 75 ? 40 : 8);
-        const y = rh - (db / 65) * rh;
-        if (i === 0) rfCtx.moveTo(x, y); else rfCtx.lineTo(x, y);
-      }
-      rfCtx.stroke();
-
-      // Micro-Doppler Rotor Blade Harmonics Spectrogram
-      const dw = dopSpecCanvas.width, dh = dopSpecCanvas.height;
-      dopCtx.fillStyle = '#020408';
-      dopCtx.fillRect(0, 0, dw, dh);
-      dopCtx.strokeStyle = '#10B981';
-      dopCtx.lineWidth = 1.2;
-      dopCtx.beginPath();
-      for (let j = 0; j < 64; j++) {
-        const x = (j / 64) * dw;
-        const d_amp = (Math.abs(j - 32) < 4 ? 38 : (Math.abs(j - 32) === 12 ? 24 : Math.random() * 6));
-        const y = dh - (d_amp / 45) * dh;
-        if (j === 0) dopCtx.moveTo(x, y); else dopCtx.lineTo(x, y);
-      }
-      dopCtx.stroke();
-
-      setTimeout(renderSpectrograms, 100);
-    }
-
-    // --- 8. UI INTERACTIONS & TABLE POPULATION ---
-    function populateTrackMatrix() {
-      const tbody = document.getElementById('track-matrix-tbody');
-      tbody.innerHTML = '';
-      for (const t of swarmTracks) {
-        const tr = document.createElement('tr');
-        if (t.id === selectedTrackId) tr.className = 'locked';
-        tr.onclick = () => selectTrack(t.id);
-
-        const bCol = (t.level === 'CRITICAL') ? 'badge-crimson' : (t.level === 'HIGH' ? 'badge-amber' : 'badge-emerald');
-        const dist = Math.round(Math.hypot(...t.enu));
-        const speed = Math.round(Math.hypot(...t.vel));
-        const ttiNum = parseFloat(t.tti);
-
-        tr.innerHTML = `
-          <td class="mono">#${t.id}</td>
-          <td><span class="badge ${bCol}">${t.class.split(' ')[0]}</span></td>
-          <td class="mono">${dist}m</td>
-          <td class="mono">${speed}m/s</td>
-          <td class="mono" style="color:${ttiNum < 6 ? 'var(--hostile-crimson)' : 'inherit'}; font-weight:700;">
-            ${t.tti}s
-            <div class="tti-bar-wrap"><div class="tti-bar-fill" style="width:${Math.max(8, Math.min(100, (1 - ttiNum/30)*100))}%;"></div></div>
-          </td>
-          <td><span class="badge badge-cyan">RAD+RF</span></td>
-          <td><button class="pill-btn" style="padding:2px 6px; font-size:9px;" onclick="selectTrack(${t.id})">LOCK</button></td>
-        `;
-        tbody.appendChild(tr);
-      }
-    }
-
-    function selectTrack(id) {
-      selectedTrackId = id;
-      const t = swarmTracks.find(item => item.id === id);
-      if (t) {
-        document.getElementById('dos-track-id').innerText = `TRK #${t.id}-ALPHA`;
-        document.getElementById('dos-class-label').innerText = t.class;
-        document.getElementById('dos-severity-badge').innerText = `${t.level} (${t.threat})`;
-        document.getElementById('dial-score-num').innerText = Math.round(t.threat);
-        document.getElementById('telem-dist').innerText = `${Math.round(Math.hypot(...t.enu))} m`;
-        document.getElementById('telem-tti').innerText = `${t.tti} s`;
-        document.getElementById('telem-vel').innerText = `${Math.round(Math.hypot(...t.vel))} m/s`;
-        document.getElementById('telem-alt').innerText = `${Math.round(t.enu[2])} m`;
-        document.getElementById('telem-cep').innerText = `IMPACT: E ${Math.round(t.enu[0] + t.vel[0]*t.tti)}m, N ${Math.round(t.enu[1] + t.vel[1]*t.tti)}m | CEP: 3.8m`;
-        playLockChime();
-      }
-      populateTrackMatrix();
-    }
-
-    function setViewMode(mode) {
-      camera.mode = mode;
-      document.getElementById('btn-view-3d').classList.toggle('active', mode === '3D_ISOMETRIC');
-      document.getElementById('btn-view-2d').classList.toggle('active', mode === '2D_PLANAR');
-      if (mode === '2D_PLANAR') {
-        camera.targetPitch = 0.0;
-        camera.targetYaw = 0.0;
-      } else {
-        camera.targetPitch = 0.78;
-        camera.targetYaw = 0.58;
-      }
-    }
-
-    function setShaderMode(mode) {
-      currentShaderMode = mode;
-      document.getElementById('btn-sh-eo').classList.toggle('active', mode === 'EO_DAYLIGHT');
-      document.getElementById('btn-sh-flir-w').classList.toggle('active', mode === 'FLIR_WHITE_HOT');
-      document.getElementById('btn-sh-flir-b').classList.toggle('active', mode === 'FLIR_BLACK_HOT');
-      document.getElementById('btn-sh-swir').classList.toggle('active', mode === 'SWIR_NIGHT_VISION');
-    }
-
-    function toggleAutonomy() {
-      autoEngage = !autoEngage;
-      const el = document.getElementById('autonomy-txt');
-      el.innerText = autoEngage ? "AUTO-ENGAGE" : "MANUAL HITL";
-      el.style.color = autoEngage ? "var(--nominal-emerald)" : "var(--suspect-amber)";
-      appendAuditLedger(`ROE updated to: ${el.innerText}`);
-    }
-
-    function toggleAudioMaster() {
-      audioEnabled = !audioEnabled;
-      const el = document.getElementById('audio-txt');
-      el.innerText = audioEnabled ? "SYNTH ON" : "MUTED";
-      el.style.color = audioEnabled ? "var(--friendly-cyan)" : "var(--text-muted)";
-    }
-
-    async function switchScenario(scen) {
-      try {
-        await fetch('/api/v1/scenario', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ scenario: scen })
-        });
-        appendAuditLedger(`Scenario switched to ${scen}`);
-      } catch(e) {}
-    }
-
-    async function fireEffector(type) {
-      activeEffector = type;
-      effectorEndTime = Date.now() + 4000;
-      appendAuditLedger(`ENGAGING ${type} against TRK #${selectedTrackId}`);
-      playBeep(420, 0.25, 'sawtooth', 0.15);
-
-      if (type === 'KINETIC_INTERCEPT') {
-        const t = swarmTracks.find(item => item.id === selectedTrackId);
-        if (t) {
-          blueInterceptors.push({
-            id: Date.now(),
-            targetId: t.id,
-            x: 0, y: 0, z: 0,
-            targetEnu: [...t.enu],
-            progress: 0.0
-          });
-        }
-      }
-
-      try {
-        await fetch('/api/v1/countermeasures/engage', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ target_id: selectedTrackId, measure_type: type, operator: "COMMANDER_C2" })
-        });
-      } catch(e) {}
-    }
-
-    async function fireCeasefire() {
-      activeEffector = null;
-      effectorEndTime = 0;
-      appendAuditLedger("EMERGENCY CEASEFIRE // ALL EFFECTORS DISENGAGED");
-      playBeep(240, 0.4, 'square', 0.2);
-      try {
-        await fetch('/api/v1/countermeasures/disengage', { method: 'POST' });
-      } catch(e) {}
-    }
-
-    function appendAuditLedger(text) {
-      const ticker = document.getElementById('audit-ticker-txt');
-      const hash = '#' + Math.random().toString(16).substring(2, 6) + '...' + Math.random().toString(16).substring(2, 6);
-      ticker.innerText = `${hash} [TACTICAL] ${text} | ${ticker.innerText.substring(0, 180)}`;
-    }
-
-    // Keyboard Shortcuts
-    window.addEventListener('keydown', (e) => {
-      if (e.key === '1') fireEffector('RF_JAMMER');
-      else if (e.key === '2') fireEffector('GPS_SPOOF');
-      else if (e.key === '3') fireEffector('OPTICAL_DAZZLER');
-      else if (e.key === '4') fireEffector('KINETIC_INTERCEPT');
-      else if (e.code === 'Space') { e.preventDefault(); fireCeasefire(); }
-      else if (e.key === 'v' || e.key === 'V') setViewMode(camera.mode === '3D_ISOMETRIC' ? '2D_PLANAR' : '3D_ISOMETRIC');
-      else if (e.key === 'm' || e.key === 'M') {
-        const modes = ['EO_DAYLIGHT', 'FLIR_WHITE_HOT', 'FLIR_BLACK_HOT', 'SWIR_NIGHT_VISION'];
-        const next = modes[(modes.indexOf(currentShaderMode) + 1) % modes.length];
-        setShaderMode(next);
-      }
-      else if (e.key === 'a' || e.key === 'A') toggleAudioMaster();
+      const lblPt = project3D(0, z.r, 0, w, h);
+      ctx.fillStyle = z.color;
+      ctx.font = '600 9.5px "JetBrains Mono"';
+      ctx.fillText(z.label, lblPt.x + 8, lblPt.y - 4);
     });
 
-    // UTC Military Clock
-    setInterval(() => {
-      const now = new Date();
-      document.getElementById('utc-clock').innerText = now.toTimeString().split(' ')[0] + '.' + String(Math.floor(now.getMilliseconds()/100)) + ' UTC';
-    }, 100);
+    if (!state) return;
 
-    // Initial Boots
-    renderBattlespaceOS();
-    renderOptronicViewport();
+    const origin = project3D(0, 0, 0, w, h);
+
+    // 3. Rotating Phased-Array Radar Sweep Cone on Ground Plane
+    const sweepRad = (state.radar_sweep_deg * Math.PI) / 180;
+    const sweepSpan = 0.28;
+    ctx.fillStyle = 'rgba(0, 240, 255, 0.08)';
+    ctx.beginPath();
+    ctx.moveTo(origin.x, origin.y);
+    for (let a = sweepRad - sweepSpan; a <= sweepRad; a += 0.04) {
+      const p = project3D(2100 * Math.sin(a), 2100 * Math.cos(a), 0, w, h);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // 4. Volumetric Effector Beams (Jammer / Dazzler directed at locked target)
+    state.effectors.forEach(eff => {
+      if (eff.state === 'ENGAGED' && eff.target_id) {
+        const tgt = state.tracks.find(t => t.target_id === eff.target_id);
+        if (tgt) {
+          const tPt = project3D(tgt.east_m, tgt.north_m, tgt.alt_m, w, h);
+          ctx.strokeStyle = eff.id === 'RF_JAMMER' ? '#FFB000' : (eff.id === 'OPTICAL_DAZZLER' ? '#A855F7' : '#0EA5E9');
+          ctx.lineWidth = 2;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(origin.x, origin.y);
+          ctx.lineTo(tPt.x, tPt.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+    });
+
+    // 5. Render Splash Shockwaves (BDA Kinetic Interceptions)
+    state.splash_events.forEach(sp => {
+      const age = (Date.now() / 1000) - sp.time;
+      const pt = project3D(sp.east_m, sp.north_m, sp.alt_m, w, h);
+      const radius = Math.max(8, Math.min(80, age * 38));
+      const alpha = Math.max(0, 1 - age / 2.5);
+      ctx.strokeStyle = `rgba(16, 185, 129, ${alpha})`;
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = `rgba(16, 185, 129, ${alpha})`;
+      ctx.font = 'bold 10px "JetBrains Mono"';
+      ctx.fillText(`BDA SPLASH // ${sp.target_id}`, pt.x + 12, pt.y - 10);
+    });
+
+    // 6. Base HQ Defense Core Icon
+    ctx.fillStyle = '#0EA5E9';
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(origin.x, origin.y, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#00F0FF';
+    ctx.font = 'bold 9.5px "JetBrains Mono"';
+    ctx.fillText('BASE HQ [0,0]', origin.x + 10, origin.y + 4);
+
+    // 7. Render Every 3D Track with Elevation Stalks, Trail Curtains & IMM Splines
+    screenTrackMap = {};
+    let lockedScreenPt = null;
+
+    state.tracks.forEach(trk => {
+      const airPt = project3D(trk.east_m, trk.north_m, trk.alt_m, w, h);
+      const groundPt = project3D(trk.east_m, trk.north_m, 0, w, h);
+      screenTrackMap[trk.target_id] = airPt;
+
+      const isSelected = trk.target_id === state.selected_target_id;
+      if (isSelected) lockedScreenPt = airPt;
+
+      const mainColor = trk.affiliation === 'HOSTILE' ? '#FF2A54' :
+                        (trk.affiliation === 'FRIENDLY' ? '#0EA5E9' :
+                        (trk.affiliation === 'NEUTRAL' ? '#10B981' : '#FFB000'));
+
+      // A. Ground Shadow Ring & Vertical 3D Elevation Stalk
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(groundPt.x, groundPt.y);
+      ctx.lineTo(airPt.x, airPt.y);
+      ctx.stroke();
+
+      ctx.fillStyle = mainColor;
+      ctx.beginPath();
+      ctx.arc(groundPt.x, groundPt.y, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // B. 3D Flight Trail & Translucent Vertical Curtain
+      if (trk.trail && trk.trail.length > 1) {
+        ctx.strokeStyle = mainColor;
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        trk.trail.forEach((pt3, idx) => {
+          const p = project3D(pt3[0], pt3[1], pt3[2] || trk.alt_m, w, h);
+          if (idx === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        });
+        ctx.lineTo(airPt.x, airPt.y);
+        ctx.stroke();
+      }
+
+      // C. 3D IMM-UKF Predicted Trajectory Spline
+      if (trk.predicted_path && trk.predicted_path.length > 1 && trk.affiliation !== 'FRIENDLY') {
+        ctx.strokeStyle = '#00F0FF';
+        ctx.lineWidth = 1.3;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(airPt.x, airPt.y);
+        trk.predicted_path.forEach(p3 => {
+          const pp = project3D(p3[0], p3[1], p3[2], w, h);
+          ctx.lineTo(pp.x, pp.y);
+        });
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // D. Locked Reticle Bracket
+      if (isSelected) {
+        ctx.strokeStyle = '#00F0FF';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.arc(airPt.x, airPt.y, 15 + Math.sin(frameCount * 0.15) * 2, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // E. NATO MIL-STD-2525D Airframe Symbol
+      ctx.lineWidth = 1.8;
+      ctx.strokeStyle = mainColor;
+      ctx.fillStyle = 'rgba(6, 10, 19, 0.85)';
+      if (trk.affiliation === 'HOSTILE') {
+        ctx.beginPath();
+        ctx.moveTo(airPt.x, airPt.y - 8);
+        ctx.lineTo(airPt.x + 8, airPt.y);
+        ctx.lineTo(airPt.x, airPt.y + 8);
+        ctx.lineTo(airPt.x - 8, airPt.y);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      } else if (trk.affiliation === 'FRIENDLY') {
+        ctx.beginPath();
+        ctx.arc(airPt.x, airPt.y, 7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        ctx.fillRect(airPt.x - 6, airPt.y - 6, 12, 12);
+        ctx.strokeRect(airPt.x - 6, airPt.y - 6, 12, 12);
+      }
+
+      // F. Floating 3D Callout Tag
+      ctx.fillStyle = isSelected ? '#00F0FF' : '#F8FAFC';
+      ctx.font = 'bold 10px "JetBrains Mono"';
+      ctx.fillText(`${trk.target_id} [${Math.round(trk.range_m)}m]`, airPt.x + 12, airPt.y - 3);
+      ctx.fillStyle = '#94A3B8';
+      ctx.font = '9px "JetBrains Mono"';
+      ctx.fillText(`ALT:${Math.round(trk.alt_m)}m | ${trk.status}`, airPt.x + 12, airPt.y + 9);
+    });
+
+    // 8. DYNAMIC TARGET-TO-DOSSIER TETHER LINE (Anduril Lattice Signature Feature)
+    if (lockedScreenPt) {
+      const dossierEl = document.getElementById('dossierPod');
+      const dRect = dossierEl.getBoundingClientRect();
+      const anchorX = dRect.left;
+      const anchorY = dRect.top + 48;
+      const elbowX = anchorX - 38;
+
+      ctx.strokeStyle = 'rgba(0, 240, 255, 0.55)';
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(lockedScreenPt.x + 14, lockedScreenPt.y);
+      ctx.lineTo(elbowX, anchorY);
+      ctx.lineTo(anchorX, anchorY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Joint node dot
+      ctx.fillStyle = '#00F0FF';
+      ctx.beginPath();
+      ctx.arc(elbowX, anchorY, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // =========================================================================
+  // 5. RENDER EO/IR GIMBAL TARGETING POD + 4X PIP ORDNANCE LOUPE
+  // =========================================================================
+  function getSelectedTrack() {
+    if (!state || !state.tracks || !state.tracks.length) return null;
+    return state.tracks.find(t => t.target_id === state.selected_target_id) || state.tracks[0];
+  }
+
+  function renderOptronicGimbal() {
+    const canvas = document.getElementById('optronicCanvas');
+    const {ctx, w, h} = fitCanvas(canvas);
+    const trk = getSelectedTrack();
+
+    // Multi-spectral shader background
+    if (shaderMode === 'WH') {
+      ctx.fillStyle = '#141923';
+      ctx.fillRect(0, 0, w, h);
+    } else if (shaderMode === 'BH') {
+      ctx.fillStyle = '#CBD5E1';
+      ctx.fillRect(0, 0, w, h);
+    } else if (shaderMode === 'NVG') {
+      ctx.fillStyle = '#03180E';
+      ctx.fillRect(0, 0, w, h);
+    } else {
+      const grad = ctx.createLinearGradient(0, 0, 0, h);
+      grad.addColorStop(0, '#071426');
+      grad.addColorStop(0.6, '#132A46');
+      grad.addColorStop(1, '#08101A');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, w, h);
+    }
+
+    // Artificial Horizon & Pitch Ladder
+    const horizonY = h * 0.56 + Math.sin(frameCount * 0.03) * 4;
+    const hudColor = shaderMode === 'BH' ? '#0F172A' : (shaderMode === 'NVG' ? '#10B981' : '#00F0FF');
+    ctx.strokeStyle = hudColor;
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath();
+    ctx.moveTo(20, horizonY);
+    ctx.lineTo(w - 20, horizonY);
+    ctx.stroke();
+    ctx.globalAlpha = 1.0;
+
+    if (!trk) return;
+
+    const cx = w * 0.45 + Math.sin(frameCount * 0.06) * 14;
+    const cy = h * 0.46 + Math.cos(frameCount * 0.05) * 10;
+
+    // Render Synthetic UAV Airframe & Thermal Motor Signatures
+    ctx.save();
+    ctx.translate(cx, cy);
+    const bodyCol = shaderMode === 'WH' ? '#FFFFFF' : (shaderMode === 'BH' ? '#0F172A' : (shaderMode === 'NVG' ? '#34D399' : '#E2E8F0'));
+    ctx.strokeStyle = bodyCol;
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.moveTo(-24, -11); ctx.lineTo(24, 11);
+    ctx.moveTo(-24, 11); ctx.lineTo(24, -11);
+    ctx.stroke();
+
+    ctx.fillStyle = bodyCol;
+    ctx.fillRect(-9, -5, 18, 10);
+    if (trk.payload_detected) {
+      ctx.fillStyle = shaderMode === 'BH' ? '#DC2626' : '#FF2A54';
+      ctx.fillRect(-5, 5, 10, 8);
+    }
+
+    // Rotor blur discs
+    [[-24, -11], [24, -11], [-24, 11], [24, 11]].forEach(([rx, ry]) => {
+      ctx.strokeStyle = hudColor;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.ellipse(rx, ry, 10, 3, (frameCount * 0.4) % Math.PI, 0, Math.PI * 2);
+      ctx.stroke();
+    });
+    ctx.restore();
+
+    // Rotating Gimbal Lock Reticle
+    const retColor = trk.affiliation === 'HOSTILE' ? '#FF2A54' : '#FFB000';
+    ctx.strokeStyle = retColor;
+    ctx.lineWidth = 1.6;
+    const b = 36;
+    ctx.strokeRect(cx - b, cy - b, b * 2, b * 2);
+
+    // Lead-computing Kalman Pipper
+    const leadX = cx + trk.vx_ms * 1.1;
+    const leadY = cy - trk.vz_ms * 2.2;
+    ctx.strokeStyle = hudColor;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(leadX, leadY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(leadX, leadY, 5, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // 4x PiP Payload Classifier Loupe on Right Side
+    const pw = 96, ph = 68;
+    const px = w - pw - 8, py = h - ph - 8;
+    ctx.fillStyle = 'rgba(3, 6, 12, 0.9)';
+    ctx.fillRect(px, py, pw, ph);
+    ctx.strokeStyle = retColor;
+    ctx.strokeRect(px, py, pw, ph);
+    ctx.fillStyle = '#F8FAFC';
+    ctx.font = '8px "JetBrains Mono"';
+    ctx.fillText('4X PAYLOAD LOUPE', px + 5, py + 11);
+    ctx.fillStyle = trk.payload_detected ? '#FF2A54' : '#10B981';
+    ctx.fillText(trk.payload_detected ? 'ARMED MUNITION' : 'CLEAN AIRFRAME', px + 5, py + ph - 6);
+    ctx.strokeStyle = '#00F0FF';
+    ctx.strokeRect(px + 28, py + 20, 38, 24);
+    if (trk.payload_detected) {
+      ctx.fillStyle = '#FF2A54';
+      ctx.fillRect(px + 38, py + 32, 18, 10);
+    }
+  }
+
+  // =========================================================================
+  // 6. RENDER SDR RF WATERFALL & MICRO-DOPPLER BLADE SPECTROGRAM
+  // =========================================================================
+  function renderSpectrograms() {
+    const trk = getSelectedTrack();
+    // RF Waterfall
+    const rfCanvas = document.getElementById('rfWaterfallCanvas');
+    const {ctx: rCtx, w: rw, h: rh} = fitCanvas(rfCanvas);
+    rCtx.fillStyle = '#03060C';
+    rCtx.fillRect(0, 0, rw, rh);
+
+    const bins = 44;
+    const row = [];
+    const isSilent = trk && trk.rf_protocol === 'RF_SILENT_AUTONOMOUS';
+    const isJammed = trk && trk.status === 'JAMMED';
+
+    for (let i = 0; i < bins; i++) {
+      let v = 0.1 + Math.random() * 0.12;
+      if (isJammed && i > 8 && i < 36) v = 0.88 + Math.random() * 0.12;
+      else if (!isSilent && (Math.abs(i - 14) <= 2 || Math.abs(i - 30) <= 2)) v = 0.68 + Math.random() * 0.25;
+      row.push(v);
+    }
+    rfWaterfallRows.unshift(row);
+    if (rfWaterfallRows.length > 22) rfWaterfallRows.pop();
+
+    const split = rh * 0.42;
+    rCtx.strokeStyle = isJammed ? '#FF2A54' : '#00F0FF';
+    rCtx.lineWidth = 1.4;
+    rCtx.beginPath();
+    row.forEach((v, idx) => {
+      const x = (idx / (bins - 1)) * rw;
+      const y = split - v * (split - 5);
+      if (idx === 0) rCtx.moveTo(x, y);
+      else rCtx.lineTo(x, y);
+    });
+    rCtx.stroke();
+
+    const cw = rw / bins;
+    const ch = (rh - split) / 22;
+    rfWaterfallRows.forEach((r, rIdx) => {
+      r.forEach((v, cIdx) => {
+        rCtx.fillStyle = v > 0.75 ? '#FF2A54' : (v > 0.45 ? '#FFB000' : (v > 0.22 ? '#0EA5E9' : '#0B1324'));
+        rCtx.fillRect(cIdx * cw, split + rIdx * ch, Math.ceil(cw), Math.ceil(ch));
+      });
+    });
+
+    // Micro-Doppler Blade Flash Canvas
+    const mdCanvas = document.getElementById('microDopplerCanvas');
+    const {ctx: mCtx, w: mw, h: mh} = fitCanvas(mdCanvas);
+    mCtx.fillStyle = '#03060C';
+    mCtx.fillRect(0, 0, mw, mh);
+
+    const midY = mh * 0.5;
+    mCtx.strokeStyle = 'rgba(56, 189, 248, 0.25)';
+    mCtx.beginPath();
+    mCtx.moveTo(0, midY);
+    mCtx.lineTo(mw, midY);
+    mCtx.stroke();
+
+    for (let x = 6; x < mw - 6; x += 4) {
+      const amp = Math.abs(Math.sin(x * 0.24 + frameCount * 0.32)) * (mh * 0.40);
+      mCtx.strokeStyle = trk && trk.affiliation === 'HOSTILE' ? 'rgba(255, 42, 84, 0.8)' : 'rgba(0, 240, 255, 0.8)';
+      mCtx.beginPath();
+      mCtx.moveTo(x, midY - amp);
+      mCtx.lineTo(x, midY + amp);
+      mCtx.stroke();
+    }
+  }
+
+  // =========================================================================
+  // 7. DOM TELEMETRY SYNCHRONIZATION
+  // =========================================================================
+  function syncDOM(newState) {
+    state = newState;
+    document.getElementById('utcClock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
+    document.getElementById('defconBannerText').textContent = state.defcon_label;
+    document.getElementById('splashCountTop').textContent = state.neutralized_count;
+    document.getElementById('roeModeText').textContent = state.roe_mode === 'AUTO_ENGAGE' ? 'AUTO-ENGAGE' : 'MANUAL HITL';
+    document.getElementById('activeTrackBadge').textContent = `${state.tracks.length} ACTIVE`;
+
+    // Swarm Track Cards
+    const listEl = document.getElementById('swarmTrackList');
+    listEl.innerHTML = state.tracks.map(t => {
+      const sel = t.target_id === state.selected_target_id ? 'selected' : '';
+      return `<div class="track-card aff-${t.affiliation} ${sel}" onclick="selectTrack('${t.target_id}')">
+        <div class="tc-row1">
+          <span class="tc-id">${t.target_id} <span class="badge-aff badge-${t.affiliation}">${t.affiliation}</span></span>
+          <span style="color:${t.threat_score >= 75 ? '#FF2A54' : '#00F0FF'};font-weight:700;">IDX ${t.threat_score}</span>
+        </div>
+        <div class="tc-row2" style="color:var(--text-dim);font-size:9.5px;">
+          <span>${t.drone_class.replace(/_/g, ' ')}</span>
+          <span>${t.range_m}m | TTI:${t.tti_s > 900 ? '--' : t.tti_s + 's'}</span>
+        </div>
+        <div class="tc-row2" style="margin-top:2px;">
+          <div style="display:flex;gap:3px;">
+            ${t.corroboration.map(c => `<span class="sensor-chip">${c}</span>`).join('')}
+          </div>
+          <span style="font-size:9px;color:#94A3B8;">${t.status}</span>
+        </div>
+      </div>`;
+    }).join('');
+
+    const trk = getSelectedTrack();
+    if (trk) {
+      document.getElementById('lrfReadout').textContent = `${trk.slant_range_m}m LOCKED`;
+      document.getElementById('wtaConfidenceTag').textContent = `Pk: ${trk.p_success}%`;
+      document.getElementById('dCallsign').textContent = `${trk.target_id} // ${trk.affiliation}`;
+      document.getElementById('dClassText').textContent = `${trk.drone_class} [${trk.payload_detected ? 'ORDNANCE ARMED' : 'NO PAYLOAD'}]`;
+      document.getElementById('dThreatIndex').textContent = `${trk.threat_score} / 100`;
+      document.getElementById('dRange').textContent = `${trk.range_m} m`;
+      document.getElementById('dBearingAlt').textContent = `${String(Math.round(trk.bearing_deg)).padStart(3,'0')}° ${trk.bearing_cardinal} / ${Math.round(trk.alt_m)}m`;
+      document.getElementById('dClosingTti').textContent = `${trk.closing_vel_ms}m/s | ${trk.tti_s > 900 ? 'N/A' : trk.tti_s + 's'}`;
+      document.getElementById('dZone').textContent = trk.zone_code + ' SECTOR';
+      document.getElementById('dRcsRpm').textContent = `${trk.rcs_dbsm}dB / ${(trk.rotor_rpm/1000).toFixed(1)}k`;
+      document.getElementById('dProtocol').textContent = trk.rf_protocol;
+
+      // Sub-score bars
+      const kin = Math.round(trk.sub_scores.kinematic_lethality);
+      const pay = Math.round(trk.sub_scores.payload_hazard);
+      const dive = Math.round(trk.imm_modes.terminal_dive * 100);
+      document.getElementById('barKin').style.width = kin + '%';
+      document.getElementById('valKin').textContent = kin + '%';
+      document.getElementById('barPay').style.width = pay + '%';
+      document.getElementById('valPay').textContent = pay + '%';
+      document.getElementById('barDive').style.width = dive + '%';
+      document.getElementById('valDive').textContent = dive + '%';
+
+      document.getElementById('specRssi').textContent = `RSSI: ${trk.rssi_dbm} dBm`;
+      document.getElementById('specRpm').textContent = `${trk.rotor_rpm} RPM`;
+      document.getElementById('dockWtaText').textContent = trk.wta_recommendation;
+
+      // Update Kill-Chain Stepper
+      for (let i = 1; i <= 6; i++) {
+        const el = document.getElementById('kc' + i);
+        el.className = 'kc-step';
+        if (i <= trk.kill_chain_num) {
+          el.classList.add(i >= 5 ? 'engage-active' : 'active');
+        }
+      }
+    }
+
+    // Effector Dock Cards
+    const effMap = {};
+    state.effectors.forEach(e => effMap[e.id] = e);
+    const updateCard = (cardId, stId, key) => {
+      const e = effMap[key];
+      if (!e) return;
+      document.getElementById(stId).textContent = e.state;
+      document.getElementById(cardId).classList.toggle('engaged', e.state === 'ENGAGED' || e.state.startsWith('LAUNCHED'));
+    };
+    updateCard('dockJammer', 'stJammer', 'RF_JAMMER');
+    updateCard('dockSpoofer', 'stSpoofer', 'GNSS_SPOOFER');
+    updateCard('dockDazzler', 'stDazzler', 'OPTICAL_DAZZLER');
+    updateCard('dockKinetic', 'stKinetic', 'KINETIC_INTERCEPTOR');
+
+    // Forensic SHA-256 Ledger Ticker
+    if (state.audit_tail && state.audit_tail.length) {
+      const head = state.audit_tail[0];
+      document.getElementById('ledgerTicker').textContent =
+        `BLOCK #${String(head.index).padStart(4, '0')} // ${head.event_type} // SHA256:${head.block_hash.slice(0, 12)} VERIFIED ✓`;
+    }
+  }
+
+  function masterRenderLoop() {
+    frameCount++;
+    renderBattlespace3D();
+    renderOptronicGimbal();
     renderSpectrograms();
-    populateTrackMatrix();
-    setInterval(populateTrackMatrix, 1000);
-  </script>
+    requestAnimationFrame(masterRenderLoop);
+  }
+
+  function connectWebSocket() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${location.host}/ws/telemetry`);
+    ws.onmessage = (e) => {
+      try { syncDOM(JSON.parse(e.data)); } catch (err) {}
+    };
+    ws.onclose = () => setTimeout(connectWebSocket, 1200);
+  }
+
+  window.addEventListener('load', () => {
+    connectWebSocket();
+    requestAnimationFrame(masterRenderLoop);
+  });
+</script>
 </body>
 </html>
 """
 
+
 @app.get("/", response_class=HTMLResponse)
-def get_command_center_ui():
-    return HTMLResponse(content=LATTICE_SPATIAL_OS_HTML)
-
 @app.get("/command-center", response_class=HTMLResponse)
-def get_command_center_alias():
-    return HTMLResponse(content=LATTICE_SPATIAL_OS_HTML)
+async def serve_spatial_command_center():
+    return HTMLResponse(content=LATTICE_SPATIAL_HTML)
 
-@app.get("/api/v1/status")
-def get_system_status():
-    summary = threat_mgr.get_summary()
-    audit_valid, block_count, audit_msg = audit_logger.verify_chain_integrity()
-    return {
-        "status": "ONLINE",
-        "system": "LATTICE-CUAS v4.0",
-        "defcon": summary["overall_threat_level"],
-        "scenario": summary["current_scenario"],
-        "automation_mode": summary["automation_mode"],
-        "active_threats": summary["active_threat_count"],
-        "total_detections": summary["total_detections"],
-        "neutralized_count": summary["neutralized_count"],
-        "actuators": {k.value: v.value for k, v in countermeasure_ctrl.statuses.items()},
-        "audit_chain": {
-            "is_valid": audit_valid,
-            "total_blocks": block_count,
-            "status_message": audit_msg
-        },
-        "timestamp": time.time()
-    }
-
-@app.get("/api/v1/threats")
-def get_threats():
-    return threat_mgr.get_summary()
-
-@app.post("/api/v1/scenario")
-def set_scenario(req: ScenarioRequest):
-    threat_mgr.set_scenario(req.scenario)
-    audit_logger.log_event("SCENARIO_CHANGED", {"scenario": req.scenario}, operator="COMMANDER_C2")
-    return {"status": "UPDATED", "scenario": req.scenario}
-
-@app.post("/api/v1/automation-mode")
-def set_automation_mode(req: AutomationModeRequest):
-    threat_mgr.automation_mode = req.mode
-    audit_logger.log_event("AUTOMATION_MODE_CHANGED", {"mode": req.mode}, operator="COMMANDER_C2")
-    return {"status": "UPDATED", "automation_mode": req.mode}
-
-@app.post("/api/v1/countermeasures/engage")
-def engage_countermeasure(req: CountermeasureRequest):
-    countermeasure_ctrl.set_operator(req.operator)
-    measure_upper = req.measure_type.upper()
-
-    if measure_upper == "RF_JAMMER":
-        res = countermeasure_ctrl.activate_rf_jammer(req.target_id, duration_sec=req.duration_sec)
-        rf_sensor.set_jammer_active(["2.4 GHz", "5.8 GHz"])
-    elif measure_upper == "GPS_SPOOF":
-        res = countermeasure_ctrl.activate_gps_spoofing(req.target_id)
-    elif measure_upper == "OPTICAL_DAZZLER":
-        res = countermeasure_ctrl.activate_optical_dazzler(req.target_id)
-    elif measure_upper == "KINETIC_INTERCEPT":
-        res = countermeasure_ctrl.launch_kinetic_interceptor(req.target_id)
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown countermeasure: {req.measure_type}")
-
-    audit_logger.log_event(
-        "EFFECTOR_ENGAGED",
-        {"target_id": req.target_id, "measure": measure_upper, "bda": res.get("bda", "ENGAGED")},
-        operator=req.operator
-    )
-    threat_mgr.clear_threat(req.target_id, neutralized=True)
-    return {"result": "ENGAGEMENT_SUCCESS", "details": res}
-
-@app.post("/api/v1/countermeasures/disengage")
-def disengage_all():
-    countermeasure_ctrl.disengage_all()
-    rf_sensor.set_jammer_active([])
-    audit_logger.log_event("CEASEFIRE_ALL_STANDBY", {}, operator="COMMANDER_C2")
-    return {"result": "DISENGAGED", "status": "ALL_STANDBY"}
-
-@app.get("/api/v1/audit/verify")
-def verify_audit_ledger():
-    valid, count, msg = audit_logger.verify_chain_integrity()
-    return {
-        "is_valid": valid,
-        "blocks_verified": count,
-        "integrity_message": msg,
-        "recent_blocks": audit_logger.get_recent_blocks(limit=8)
-    }
-
-@app.websocket("/ws/telemetry")
-async def websocket_telemetry(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        while True:
-            summary = threat_mgr.get_summary()
-            data = {
-                "timestamp": time.time(),
-                "summary": summary,
-                "actuators": {k.value: v.value for k, v in countermeasure_ctrl.statuses.items()},
-                "rf_spectrum": rf_sensor.generate_waterfall_slice(2437.0, target_present=True),
-                "audit_recent": audit_logger.get_recent_blocks(limit=5)
-            }
-            await websocket.send_json(data)
-            await asyncio.sleep(0.5)
-    except WebSocketDisconnect:
-        logger.info("Client disconnected from telemetry stream.")
 
 def run_server(host: str = "127.0.0.1", port: int = 8080):
     import uvicorn
-    logger.info(f"Starting LATTICE-CUAS C2 Server on http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    uvicorn.run("api.api_server:app", host=host, port=port, reload=False)
+
 
 if __name__ == "__main__":
     run_server()
