@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints and weights
+*.pt
+*.pth
+*.onnx
+models/*.pt
+models/*.pth
+!models/README.md
+
+# Logs & Audit records
+logs/*.log
+logs/audit/*.jsonl
+logs/test_audit/
+
+# Temporary and video recordings
+*.mp4
+*.avi
+*.mkv
+data/recordings/
+
+# Environment and IDE
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp

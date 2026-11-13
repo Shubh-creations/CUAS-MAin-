@@ -1,0 +1,23 @@
+# Core Deep Learning & Computer Vision
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=9.5.0
+
+# Desktop GUI Interface
+PyQt5>=5.15.9
+
+# System Monitoring & Telemetry
+psutil>=5.9.0
+pyyaml>=6.0
+
+# FastAPI REST & WebSocket C2 Command Service
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Numerical, Geospatial & Scientific Analysis
+scipy>=1.10.0
+matplotlib>=3.7.0

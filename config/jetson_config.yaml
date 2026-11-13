@@ -1,0 +1,42 @@
+# Jetson Embedded Configuration for CUAS
+
+system:
+  app_name: "CUAS Edge Embedded (Jetson Edition)"
+  version: "2.5.0"
+  log_level: "WARNING"
+  device: "cuda"
+  allow_cpu_fallback: false
+  enable_profiling: false
+  precision: "fp16"
+
+camera:
+  source: 0
+  width: 640
+  height: 480
+  target_fps: 20
+  simulation_mode: false
+
+detection:
+  model_type: "yolov8n"          # Lightweight nano model for Jetson
+  confidence_threshold: 0.50
+  iou_threshold: 0.45
+  max_tracked_targets: 6
+
+classification:
+  enabled: true
+  model_architecture: "mobilenet_v2"
+  input_resolution: [160, 160]
+
+trajectory:
+  history_steps: 15
+  prediction_horizon_steps: 25
+
+sensors:
+  rf_spectrum:
+    enabled: true
+    scan_frequencies_mhz: [2400, 5800]
+  radar:
+    enabled: false               # Disabled to conserve edge memory
+
+countermeasures:
+  auto_engagement: false

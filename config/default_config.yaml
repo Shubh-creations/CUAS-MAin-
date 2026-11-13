@@ -1,0 +1,93 @@
+# Configuration for Counter-UAS (CUAS) Autonomous Defense Framework
+
+system:
+  app_name: "CUAS Tactical C2 System"
+  version: "2.5.0"
+  log_level: "INFO"
+  device: "auto"          # "auto", "cuda", or "cpu"
+  allow_cpu_fallback: true
+  enable_profiling: true
+
+defense_zone:
+  base_latitude: 37.7749
+  base_longitude: -122.4194
+  base_altitude_m: 50.0
+  inner_defense_radius_m: 500.0   # Red Zone: Kill / Neutralize zone
+  warning_radius_m: 1500.0        # Amber Zone: Track & Target lock
+  outer_detection_radius_m: 3500.0 # Green Zone: Early warning radar / RF
+
+camera:
+  source: 0                       # Camera index (0), RTSP URL, or video path
+  width: 1280
+  height: 720
+  target_fps: 30
+  simulation_mode: false          # If true, generates synthetic drone flights for testing
+
+detection:
+  model_type: "fasterrcnn"        # "fasterrcnn" or "yolov8"
+  confidence_threshold: 0.60
+  iou_threshold: 0.45
+  target_classes:
+    - "drone"
+    - "airplane"
+    - "bird"
+    - "uav"
+  max_tracked_targets: 16
+
+classification:
+  enabled: true
+  model_architecture: "resnet18"
+  input_resolution: [224, 224]
+  classes:
+    0: "SURVEILLANCE_DRONE"
+    1: "SUICIDE_DRONE"
+    2: "CIVILIAN_MULTIROTOR"
+    3: "CUSTOMIZED_DRONE"
+    4: "UNKNOWN_AIR_VEHICLE"
+  threat_weights:
+    "SUICIDE_DRONE": 1.0
+    "CUSTOMIZED_DRONE": 0.8
+    "SURVEILLANCE_DRONE": 0.6
+    "UNKNOWN_AIR_VEHICLE": 0.4
+    "CIVILIAN_MULTIROTOR": 0.2
+
+trajectory:
+  history_steps: 30
+  prediction_horizon_steps: 45    # ~1.5s ahead at 30 fps
+  kalman_process_noise: 0.05
+  kalman_measurement_noise: 0.20
+  velocity_smoothing_window: 5
+
+sensors:
+  rf_spectrum:
+    enabled: true
+    scan_frequencies_mhz: [2400, 2450, 5725, 5850]
+    protocols: ["OcuSync", "Lightbridge", "ExpressLRS", "Crossfire", "WiFi-Telemetry"]
+    triangulation_antennae: 3
+  radar:
+    enabled: true
+    sweep_rate_hz: 2.0
+    max_range_m: 5000.0
+    doppler_sensitivity_mps: 1.5
+
+countermeasures:
+  auto_engagement: false           # Require operator confirmation for kinetic / high-power RF
+  rf_jammer:
+    power_watts: 50
+    bands: ["2.4GHz", "5.8GHz", "GNSS-L1"]
+  gps_spoofing:
+    enabled: true
+    spoof_target_mode: "RETURN_TO_HOME_FORCED"
+  laser_dazzler:
+    enabled: true
+    optical_blinding: true
+  interceptor_drone:
+    enabled: true
+    launch_time_sec: 4.5
+    speed_mps: 35.0
+
+telemetry_api:
+  host: "127.0.0.1"
+  port: 8080
+  websocket_enabled: true
+  cors_origins: ["*"]

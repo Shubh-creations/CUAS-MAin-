@@ -1,1008 +1,801 @@
-# C-UAS Military-Style Dashboard with User Authentication and Drone Classification
+"""
+C-UAS Military-Style Command and Control Dashboard (Enhanced Edition).
+Integrates Deep Vision Detection, Real-Time Drone Classification, Kalman Trajectory Prediction,
+Multi-Modal Sensor Fusion (Camera, RF, Radar), and Tactical Countermeasure Engagement.
+"""
 
 import sys
+import os
 import cv2
 import datetime
-import os
-import numpy as np
+import math
 import random
-import requests
-from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
-                             QFileDialog, QHBoxLayout, QMenuBar, QAction, QFrame,
-                             QGridLayout, QSplitter, QGraphicsDropShadowEffect, QProgressBar,
-                             QLineEdit, QDialog, QFormLayout, QComboBox, QCheckBox, QTabWidget,
-                             QTextEdit, QStackedWidget)
-from PyQt5.QtCore import QTimer, Qt, QSize
-from PyQt5.QtGui import QPixmap, QImage, QColor, QFont, QPalette, QBrush, QPainter, QPen, QFontDatabase
-import torch
-import torch.nn as nn
-from torchvision import transforms
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
-import torchvision.models as models
-from PIL import Image, ImageQt
+import time
 from collections import deque
+from typing import Optional, List, Tuple, Dict, Any
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
+    QFileDialog, QHBoxLayout, QMenuBar, QAction, QFrame,
+    QGridLayout, QSplitter, QGraphicsDropShadowEffect, QProgressBar,
+    QLineEdit, QDialog, QFormLayout, QComboBox, QCheckBox, QTabWidget,
+    QTextEdit, QStackedWidget, QMessageBox, QGroupBox
+)
+from PyQt5.QtCore import QTimer, Qt, QSize, pyqtSignal, QThread
+from PyQt5.QtGui import QPixmap, QImage, QColor, QFont, QPainter, QPen, QBrush
+
+import torch
+import numpy as np
 import psutil
+
 try:
     import pynvml as nvml
 except Exception:
     nvml = None
-import time
 
-# Drone classifier from Program 2
-class DroneClassifier(nn.Module):
-    def __init__(self):
-        super(DroneClassifier, self).__init__()
-        self.base_model = models.resnet18(pretrained=True)
-        self.base_model.fc = nn.Linear(self.base_model.fc.in_features, 5)
+from utils.logger import get_logger
+from utils.geo_utils import haversine_distance, calculate_bearing, check_geofence_status
+from utils.visualization import draw_corner_brackets, draw_targeting_reticle, draw_trajectory_path
+from ai_core.detection import DroneDetector, TrackedDrone, SyntheticDroneGenerator
+from ai_core.classifier import DroneClassifierEngine, DroneClassificationResult
+from ai_core.trajectory_predictor import TrajectoryPredictor, TrajectoryPrediction
+from ai_core.response_engine import ThreatResponseEngine, ThreatEvaluation
+from sensors.rf_sensor import RFSensorSimulator, RFEmission
+from sensors.radar_sensor import RadarSensorSimulator, RadarContact
+from sensors.sensor_fusion import SensorFusionHub, FusedTacticalTrack
+from control_unit.neutralization import CountermeasureController, CountermeasureType, ActuatorStatus
+from control_unit.threat_manager import ThreatManager
+from control_unit.audit_logger import ForensicAuditLogger
 
-    def forward(self, x):
-        return self.base_model(x)
+logger = get_logger("CUAS.GUI")
 
-# Load military style font
-def load_military_font():
-    # In a real application, you would load an actual military font file
-    # For this example, we'll use a system font that looks somewhat military
-    font_id = QFontDatabase.addApplicationFont(":/fonts/military.ttf")
-    if font_id < 0:
-        # If font loading fails, use a fallback font that's likely available
-        return QFont("Courier New", 10, QFont.Bold)
-    else:
-        font_family = QFontDatabase.applicationFontFamilies(font_id)[0]
-        return QFont(font_family, 10)
-
-# Custom styled panel for dashboard elements
+# Custom styled military panel
 class DashboardPanel(QFrame):
     def __init__(self, title="", parent=None):
         super().__init__(parent)
         self.setObjectName("dashboardPanel")
         self.setStyleSheet("""
             #dashboardPanel {
-                background-color: #000000;
-                border: 1px solid #ffffff;
-                border-radius: 0px;
+                background-color: #050805;
+                border: 1px solid #1f3a1f;
+                border-radius: 2px;
             }
         """)
-        
-        # Add shadow effect
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(10)
-        shadow.setColor(QColor(255, 255, 255, 120))
-        shadow.setOffset(2, 2)
+        shadow.setBlurRadius(8)
+        shadow.setColor(QColor(0, 255, 0, 40))
+        shadow.setOffset(1, 1)
         self.setGraphicsEffect(shadow)
-        
-        # Layout
+
         self.layout = QVBoxLayout(self)
-        
-        # Title if provided
+        self.layout.setContentsMargins(8, 8, 8, 8)
+        self.layout.setSpacing(6)
+
         if title:
             title_label = QLabel(title)
-            military_font = QFont("Courier New", 12, QFont.Bold)
-            title_label.setFont(military_font)
+            title_label.setFont(QFont("Courier New", 10, QFont.Bold))
             title_label.setStyleSheet("""
-                color: #ffffff;
-                padding-bottom: 5px;
-                border-bottom: 1px solid #ffffff;
+                color: #00ff66;
+                padding-bottom: 4px;
+                border-bottom: 1px solid #1f3a1f;
             """)
             self.layout.addWidget(title_label)
 
-# Military-style satellite map visualization
+
+# Tactical 3D Radar Scope Widget
+class RadarScopeWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(220, 220)
+        self.setStyleSheet("background-color: #000000; border: 1px solid #1f3a1f;")
+        self.sweep_angle = 0.0
+        self.contacts: List[Tuple[float, float, str]] = []  # (azimuth_deg, distance_norm, threat_level)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.rotate_sweep)
+        self.timer.start(40)
+
+    def rotate_sweep(self):
+        self.sweep_angle = (self.sweep_angle + 4.5) % 360.0
+        self.update()
+
+    def set_contacts(self, contacts: List[Tuple[float, float, str]]):
+        self.contacts = contacts
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w // 2, cy = h // 2
+        radius = min(cx, cy) - 10
+
+        # Background
+        painter.fillRect(self.rect(), QColor(0, 0, 0))
+
+        # Range rings
+        painter.setPen(QPen(QColor(0, 80, 0), 1))
+        for r_factor in [0.33, 0.66, 1.0]:
+            r_curr = int(radius * r_factor)
+            painter.drawEllipse(cx - r_curr, cy - r_curr, r_curr * 2, r_curr * 2)
+
+        # Crosshairs
+        painter.drawLine(cx - radius, cy, cx + radius, cy)
+        painter.drawLine(cx, cy - radius, cx, cy + radius)
+
+        # Radar labels
+        painter.setPen(QColor(0, 180, 0))
+        painter.setFont(QFont("Courier New", 7))
+        painter.drawText(cx + 4, cy - radius + 12, "3.5km")
+        painter.drawText(cx + 4, cy - int(radius * 0.66) + 12, "2.0km")
+        painter.drawText(cx + 4, cy - int(radius * 0.33) + 12, "1.0km")
+
+        # Rotating beam
+        rad = math.radians(self.sweep_angle - 90)
+        bx = int(cx + radius * math.cos(rad))
+        by = int(cy + radius * math.sin(rad))
+        painter.setPen(QPen(QColor(0, 255, 60), 2))
+        painter.drawLine(cx, cy, bx, by)
+
+        # Contacts
+        for az_deg, dist_ratio, level in self.contacts:
+            c_rad = math.radians(az_deg - 90)
+            c_r = max(10, min(radius, int(radius * dist_ratio)))
+            px = int(cx + c_r * math.cos(c_rad))
+            py = int(cy + c_r * math.sin(c_rad))
+
+            if level in ["CRITICAL", "HIGH"]:
+                p_col = QColor(255, 0, 0)
+            elif level == "ELEVATED":
+                p_col = QColor(255, 180, 0)
+            else:
+                p_col = QColor(0, 255, 0)
+
+            painter.setBrush(QBrush(p_col))
+            painter.setPen(QPen(p_col, 1))
+            painter.drawEllipse(px - 4, py - 4, 8, 8)
+
+
+# Military Satellite Map View
 class SatelliteMapWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(400, 300)
-        self.setStyleSheet("background-color: #000000;")
-        
-        # Default coordinates (will be updated with actual location)
+        self.setMinimumSize(250, 180)
+        self.setStyleSheet("background-color: #000000; border: 1px solid #1f3a1f;")
         self.latitude = 37.7749
         self.longitude = -122.4194
-        
-        # Blinking effect for location marker
+        self.drone_lat = None
+        self.drone_lon = None
+        self.threat_zone = "GREEN"
+
         self.blink_timer = QTimer(self)
         self.blink_timer.timeout.connect(self.update)
         self.blink_timer.start(500)
         self.blink_state = True
-        
-        # Load a satellite map background image
-        # In a real app, you would load an actual satellite image
-        self.map_image = None
-    
+
+    def set_coordinates(self, lat: float, lng: float, drone_lat: Optional[float] = None, drone_lon: Optional[float] = None, zone: str = "GREEN"):
+        self.latitude = lat
+        self.longitude = lng
+        self.drone_lat = drone_lat
+        self.drone_lon = drone_lon
+        self.threat_zone = zone
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        
-        # Draw black background
-        painter.fillRect(self.rect(), QColor(0, 0, 0))
-        
-        # Draw grid lines (simulating map grid)
-        painter.setPen(QPen(QColor(0, 100, 0), 1, Qt.DotLine))
-        
-        # Draw horizontal grid lines
-        for y in range(0, self.height(), 20):
-            painter.drawLine(0, y, self.width(), y)
-            
-        # Draw vertical grid lines
-        for x in range(0, self.width(), 20):
-            painter.drawLine(x, 0, x, self.height())
-        
-        # Draw latitude/longitude lines
-        painter.setPen(QPen(QColor(0, 150, 0), 1))
-        
-        # Draw main latitude/longitude lines
-        painter.drawLine(0, self.height() // 2, self.width(), self.height() // 2)  # Equator
-        painter.drawLine(self.width() // 2, 0, self.width() // 2, self.height())  # Prime meridian
-        
-        # Draw coordinate labels
-        painter.setPen(QColor(255, 255, 255))
-        painter.setFont(QFont("Courier New", 8))
-        
-        # Draw some fake coordinates around the map
-        for i in range(1, 5):
-            # Latitude markers
-            y_pos = int(self.height() * i / 5)
-            painter.drawText(5, y_pos, f"{90 - i*30:d}°N")
-            
-            # Longitude markers
-            x_pos = int(self.width() * i / 5)
-            painter.drawText(x_pos, 15, f"{i*30:d}°E")
-        
-        # Calculate position based on coordinates
-        # This is a simplified mapping - in a real app you would use proper projection
-        x = int(self.width() * (self.longitude + 180) / 360)
-        y = int(self.height() * (90 - self.latitude) / 180)
-        
-        # Draw location marker (pulsating red dot)
-        if self.blink_state:
-            # Outer glow
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(255, 0, 0, 50))
-            painter.drawEllipse(x - 15, y - 15, 30, 30)
-            
-            # Inner dot
-            painter.setBrush(QColor(255, 0, 0, 200))
-            painter.drawEllipse(x - 5, y - 5, 10, 10)
-            
-            # Targeting lines
-            painter.setPen(QPen(QColor(255, 0, 0), 1))
-            painter.drawLine(x - 20, y, x - 10, y)  # Left
-            painter.drawLine(x + 10, y, x + 20, y)  # Right
-            painter.drawLine(x, y - 20, x, y - 10)  # Top
-            painter.drawLine(x, y + 10, x, y + 20)  # Bottom
-        
-        # Draw border
-        painter.setPen(QPen(QColor(255, 255, 255), 2))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawRect(1, 1, self.width() - 2, self.height() - 2)
-        
-        # Draw corner brackets
-        bracket_size = 20
-        painter.setPen(QPen(QColor(0, 255, 0), 2))
-        
-        # Top-left
-        painter.drawLine(0, 0, bracket_size, 0)
-        painter.drawLine(0, 0, 0, bracket_size)
-        
-        # Top-right
-        painter.drawLine(self.width(), 0, self.width() - bracket_size, 0)
-        painter.drawLine(self.width(), 0, self.width(), bracket_size)
-        
-        # Bottom-left
-        painter.drawLine(0, self.height(), bracket_size, self.height())
-        painter.drawLine(0, self.height(), 0, self.height() - bracket_size)
-        
-        # Bottom-right
-        painter.drawLine(self.width(), self.height(), self.width() - bracket_size, self.height())
-        painter.drawLine(self.width(), self.height(), self.width(), self.height() - bracket_size)
-    
-    def set_coordinates(self, lat, lng):
-        self.latitude = lat
-        self.longitude = lng
-        self.update()  # Trigger repaint
+        painter.fillRect(self.rect(), QColor(2, 6, 2))
 
-# Login dialog
+        w, h = self.width(), self.height()
+        cx, cy = w // 2, h // 2
+
+        # Grid lines
+        painter.setPen(QPen(QColor(0, 60, 0), 1, Qt.DotLine))
+        for y in range(0, h, 25):
+            painter.drawLine(0, y, w, y)
+        for x in range(0, w, 25):
+            painter.drawLine(x, 0, x, h)
+
+        # Defense Rings around Base (Center)
+        # Outer
+        painter.setPen(QPen(QColor(0, 150, 0), 1))
+        painter.drawEllipse(cx - 70, cy - 70, 140, 140)
+        # Warning
+        painter.setPen(QPen(QColor(180, 140, 0), 1, Qt.DashLine))
+        painter.drawEllipse(cx - 45, cy - 45, 90, 90)
+        # Killzone
+        painter.setPen(QPen(QColor(200, 0, 0), 1, Qt.DashLine))
+        painter.drawEllipse(cx - 20, cy - 20, 40, 40)
+
+        # Base icon
+        painter.setBrush(QBrush(QColor(0, 255, 100)))
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.drawRect(cx - 4, cy - 4, 8, 8)
+        painter.drawText(cx + 8, cy + 4, "HQ BASE")
+
+        # Drone Target Marker
+        if self.drone_lat is not None and self.drone_lon is not None and self.blink_state:
+            d_lat = self.drone_lat - self.latitude
+            d_lon = self.drone_lon - self.longitude
+            dx = int(cx + (d_lon * 12000.0))
+            dy = int(cy - (d_lat * 12000.0))
+            dx = max(10, min(w - 10, dx))
+            dy = max(10, min(h - 10, dy))
+
+            d_col = QColor(255, 0, 0) if self.threat_zone == "RED" else QColor(255, 180, 0)
+            painter.setBrush(QBrush(d_col))
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawEllipse(dx - 5, dy - 5, 10, 10)
+            painter.drawText(dx + 8, dy + 4, f"TARGET [{self.threat_zone}]")
+
+
+# Login Dialog
 class LoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("C-UAS AUTHENTICATION")
-        self.setFixedSize(400, 250)
+        self.setWindowTitle("CUAS MILITARY ACCESS AUTHENTICATION")
+        self.setFixedSize(450, 280)
         self.setStyleSheet("""
             QDialog {
-                background-color: #000000;
+                background-color: #030803;
+                border: 2px solid #00ff66;
             }
             QLabel {
-                color: #ffffff;
+                color: #00ff66;
                 font-family: 'Courier New';
                 font-weight: bold;
             }
             QLineEdit {
-                background-color: #000000;
+                background-color: #0a140a;
                 color: #ffffff;
-                border: 1px solid #ffffff;
-                padding: 5px;
+                border: 1px solid #00ff66;
+                padding: 6px;
                 font-family: 'Courier New';
+                font-size: 13px;
             }
             QPushButton {
-                background-color: #000000;
-                color: #ffffff;
-                border: 1px solid #ffffff;
-                padding: 8px 16px;
+                background-color: #002200;
+                color: #00ff66;
+                border: 1px solid #00ff66;
+                padding: 10px;
                 font-family: 'Courier New';
                 font-weight: bold;
+                font-size: 14px;
             }
             QPushButton:hover {
-                background-color: #003300;
+                background-color: #004400;
+                color: #ffffff;
             }
         """)
-        
+
         layout = QVBoxLayout(self)
-        
-        # Title
-        title = QLabel("ENTER YOUR CREDENTIALS")
+        title = QLabel("C-UAS DEFENSE COMMAND")
         title.setFont(QFont("Courier New", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
-        
-        # Form layout
-        form_layout = QFormLayout()
-        
-        # Name field
+
+        form = QFormLayout()
         self.name_input = QLineEdit()
-        name_label = QLabel("NAME:")
-        name_label.setFont(QFont("Courier New", 12, QFont.Bold))
-        form_layout.addRow(name_label, self.name_input)
-        
-        # Profile field
+        self.name_input.setPlaceholderText("e.g. CDR. SHUBHAM PAWAR")
+        name_lbl = QLabel("OPERATOR ID:")
+        form.addRow(name_lbl, self.name_input)
+
         self.profile_input = QLineEdit()
-        profile_label = QLabel("PROFILE:")
-        profile_label.setFont(QFont("Courier New", 12, QFont.Bold))
-        form_layout.addRow(profile_label, self.profile_input)
-        
-        layout.addLayout(form_layout)
-        layout.addSpacing(20)
-        
-        # Login button
-        login_button = QPushButton("ACCESS SYSTEM")
-        login_button.clicked.connect(self.accept)
-        layout.addWidget(login_button)
-        
-        # Blinking effect for title
-        self.blink_timer = QTimer(self)
-        self.blink_timer.timeout.connect(self.blink_title)
-        self.blink_timer.start(500)
-        self.blink_state = True
-    
-    def blink_title(self):
-        self.blink_state = not self.blink_state
-        if self.blink_state:
-            self.setStyleSheet(self.styleSheet().replace("color: #ffffff;", "color: #ffffff;"))
-        else:
-            self.setStyleSheet(self.styleSheet().replace("color: #ffffff;", "color: #333333;"))
+        self.profile_input.setPlaceholderText("e.g. DEFCON-1 TACTICAL CONTROLLER")
+        profile_lbl = QLabel("SECURITY CLEARANCE:")
+        form.addRow(profile_lbl, self.profile_input)
 
-# Drone details form for 'Other' classification
-class DroneDetailsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("DRONE CLASSIFICATION DETAILS")
-        self.setFixedSize(500, 400)
-        self.setStyleSheet("""
-            QDialog, QTabWidget, QWidget {
-                background-color: #000000;
-            }
-            QLabel {
-                color: #ffffff;
-                font-family: 'Courier New';
-                font-weight: bold;
-            }
-            QLineEdit, QTextEdit, QComboBox {
-                background-color: #000000;
-                color: #ffffff;
-                border: 1px solid #ffffff;
-                padding: 5px;
-                font-family: 'Courier New';
-            }
-            QCheckBox {
-                color: #ffffff;
-                font-family: 'Courier New';
-            }
-            QPushButton {
-                background-color: #000000;
-                color: #ffffff;
-                border: 1px solid #ffffff;
-                padding: 8px 16px;
-                font-family: 'Courier New';
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #003300;
-            }
-            QTabWidget::pane {
-                border: 1px solid #ffffff;
-            }
-            QTabBar::tab {
-                background-color: #000000;
-                color: #ffffff;
-                border: 1px solid #ffffff;
-                padding: 5px 10px;
-                margin-right: 2px;
-            }
-            QTabBar::tab:selected {
-                background-color: #003300;
-            }
-        """)
-        
-        layout = QVBoxLayout(self)
-        
-        # Create tab widget
-        tabs = QTabWidget()
-        
-        # Basic info tab
-        basic_tab = QWidget()
-        basic_layout = QFormLayout(basic_tab)
-        
-        self.model_input = QLineEdit()
-        basic_layout.addRow(QLabel("MODEL:"), self.model_input)
-        
-        self.size_combo = QComboBox()
-        self.size_combo.addItems(["Small", "Medium", "Large"])
-        basic_layout.addRow(QLabel("SIZE:"), self.size_combo)
-        
-        self.munition_check = QCheckBox("Has Munition")
-        basic_layout.addRow(self.munition_check)
-        
-        self.gps_denied_check = QCheckBox("GPS-Denied Capability")
-        basic_layout.addRow(self.gps_denied_check)
-        
-        # Capabilities tab
-        capabilities_tab = QWidget()
-        capabilities_layout = QFormLayout(capabilities_tab)
-        
-        self.range_input = QLineEdit()
-        capabilities_layout.addRow(QLabel("RANGE (km):"), self.range_input)
-        
-        self.payload_input = QLineEdit()
-        capabilities_layout.addRow(QLabel("PAYLOAD (kg):"), self.payload_input)
-        
-        self.camera_check = QCheckBox("Advanced Camera")
-        capabilities_layout.addRow(self.camera_check)
-        
-        self.thermal_check = QCheckBox("Thermal Imaging")
-        capabilities_layout.addRow(self.thermal_check)
-        
-        # Notes tab
-        notes_tab = QWidget()
-        notes_layout = QVBoxLayout(notes_tab)
-        
-        notes_layout.addWidget(QLabel("ADDITIONAL NOTES:"))
-        self.notes_text = QTextEdit()
-        notes_layout.addWidget(self.notes_text)
-        
-        # Add tabs to widget
-        tabs.addTab(basic_tab, "BASIC INFO")
-        tabs.addTab(capabilities_tab, "CAPABILITIES")
-        tabs.addTab(notes_tab, "NOTES")
-        
-        layout.addWidget(tabs)
-        
-        # Save button
-        save_button = QPushButton("SAVE CLASSIFICATION")
-        save_button.clicked.connect(self.accept)
-        layout.addWidget(save_button)
+        layout.addLayout(form)
+        layout.addSpacing(15)
 
+        login_btn = QPushButton("AUTHENTICATE & ENTER C2 SYSTEM")
+        login_btn.clicked.connect(self.accept)
+        layout.addWidget(login_btn)
+
+
+# Main C2 Application Window
 class DesktopApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("C-UAS CONTROL CENTER")
-        self.setMinimumSize(1200, 800)
-        
-        # Set black background theme
+        self.setWindowTitle("CUAS - Counter-UAS Autonomous Defense Command (AI-Native)")
+        self.setMinimumSize(1300, 850)
+
+        # Initialize AI Core, Sensors, and Control subsystems
+        self.detector = DroneDetector(confidence_threshold=0.55, device="auto")
+        self.classifier = DroneClassifierEngine(device="auto")
+        self.trajectory_predictor = TrajectoryPredictor(history_len=25, forecast_steps=35, fps=30.0)
+        self.threat_engine = ThreatResponseEngine()
+        self.threat_mgr = ThreatManager()
+        self.rf_sensor = RFSensorSimulator()
+        self.radar_sensor = RadarSensorSimulator()
+        self.fusion_hub = SensorFusionHub()
+        self.countermeasure_ctrl = CountermeasureController()
+        self.audit_logger = ForensicAuditLogger()
+
+        self.synthetic_gen: Optional[SyntheticDroneGenerator] = None
+        self.is_simulation_mode = False
+        self.cap: Optional[cv2.VideoCapture] = None
+
+        self.user_name = "CDR. S. PAWAR"
+        self.user_profile = "DEFCON-1 CONTROLLER"
+
+        # Performance counters
+        self._frame_times = deque(maxlen=60)
+        self._last_fps = 0.0
+        self._last_latency = 0
+        self._current_classification: Optional[DroneClassificationResult] = None
+        self._current_threat: Optional[ThreatEvaluation] = None
+
+        self.setup_ui()
+
+    def setup_ui(self):
         self.setStyleSheet("""
             QWidget {
-                background-color: #000000;
-                color: #ffffff;
+                background-color: #030703;
+                color: #d0ffd0;
                 font-family: 'Courier New';
             }
             QLabel {
-                color: #ffffff;
+                color: #d0ffd0;
             }
             QPushButton {
-                background-color: #000000;
-                color: #ffffff;
-                border: 1px solid #ffffff;
-                padding: 8px 16px;
+                background-color: #081a08;
+                color: #00ff66;
+                border: 1px solid #00aa44;
+                padding: 6px 12px;
+                font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #003300;
+                background-color: #003311;
+                border: 1px solid #00ff66;
+            }
+            QPushButton:disabled {
+                background-color: #0a0e0a;
+                color: #335533;
+                border: 1px solid #1a2a1a;
             }
             QMenuBar {
                 background-color: #000000;
-                color: #ffffff;
-                border-bottom: 1px solid #ffffff;
+                color: #00ff66;
+                border-bottom: 1px solid #1f3a1f;
             }
             QMenuBar::item:selected {
-                background-color: #003300;
+                background-color: #003311;
             }
         """)
-        
-        # Main layout with stacked widget for login/main screens
+
         self.main_container = QVBoxLayout(self)
         self.main_container.setContentsMargins(0, 0, 0, 0)
-        self.main_container.setSpacing(0)
-        
         self.stacked_widget = QStackedWidget()
-        
-        # Create login page
+
+        # Login Screen
         self.login_page = QWidget()
-        login_layout = QVBoxLayout(self.login_page)
-        login_layout.setAlignment(Qt.AlignCenter)
-        
-        # Title for login page
-        login_title = QLabel("C-UAS CONTROL CENTER")
-        login_title.setFont(QFont("Courier New", 24, QFont.Bold))
-        login_title.setAlignment(Qt.AlignCenter)
-        login_title.setStyleSheet("color: #ffffff; margin-bottom: 30px;")
-        login_layout.addWidget(login_title)
-        
-        # Login button
-        login_button = QPushButton("ENTER YOUR NAME AND PROFILE")
-        login_button.setFont(QFont("Courier New", 14, QFont.Bold))
-        login_button.setFixedSize(400, 50)
-        login_button.clicked.connect(self.show_login_dialog)
-        login_layout.addWidget(login_button)
-        
-        # Create main application page
+        login_vbox = QVBoxLayout(self.login_page)
+        login_vbox.setAlignment(Qt.AlignCenter)
+
+        title = QLabel("C-UAS AUTONOMOUS DEFENSE COMMAND CENTER")
+        title.setFont(QFont("Courier New", 22, QFont.Bold))
+        title.setStyleSheet("color: #00ff66; margin-bottom: 20px;")
+        login_vbox.addWidget(title)
+
+        auth_btn = QPushButton("INITIATE DEFENSE AUTHENTICATION")
+        auth_btn.setFont(QFont("Courier New", 14, QFont.Bold))
+        auth_btn.setFixedSize(420, 50)
+        auth_btn.clicked.connect(self.show_login_dialog)
+        login_vbox.addWidget(auth_btn)
+
+        # Main C2 Screen
         self.main_page = QWidget()
-        main_layout = QVBoxLayout(self.main_page)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
-        
-        # Initialize status_label here to ensure it exists
-        self.status_label = QLabel("SYSTEM STATUS: ONLINE | LAST UPDATE: " + 
-                             datetime.datetime.now().strftime("%H:%M:%S"))
-        self.status_label.setFont(QFont("Courier New", 10))
-        
-        # Menu bar
+        main_vbox = QVBoxLayout(self.main_page)
+        main_vbox.setContentsMargins(8, 8, 8, 8)
+        main_vbox.setSpacing(8)
+
+        # Menu Bar
         self.menu_bar = QMenuBar(self)
-        self.menu_bar.setFont(QFont("Courier New", 10, QFont.Bold))
-        
-        # Menu bar items
         file_menu = self.menu_bar.addMenu("FILE")
-        upload_action = QAction("Upload Video", self)
-        camera_action = QAction("Open Camera", self)
-        file_menu.addAction(upload_action)
-        file_menu.addAction(camera_action)
-        
-        upload_action.triggered.connect(self.load_video)
-        camera_action.triggered.connect(self.open_camera)
-        
-        main_layout.setMenuBar(self.menu_bar)
-        
-        # Header with user info and time
+        act_video = QAction("Open Video File", self)
+        act_cam = QAction("Open Live Camera", self)
+        act_sim = QAction("Launch Tactical Simulation", self)
+        file_menu.addAction(act_video)
+        file_menu.addAction(act_cam)
+        file_menu.addAction(act_sim)
+
+        act_video.triggered.connect(self.load_video)
+        act_cam.triggered.connect(self.open_camera)
+        act_sim.triggered.connect(self.start_simulation)
+
+        tools_menu = self.menu_bar.addMenu("ECM WEAPONS")
+        act_disengage = QAction("Emergency Disengage All Effectors", self)
+        act_disengage.triggered.connect(self.disengage_countermeasures)
+        tools_menu.addAction(act_disengage)
+
+        main_vbox.setMenuBar(self.menu_bar)
+
+        # Header Bar
         header = QHBoxLayout()
-        self.user_label = QLabel("OPERATOR: NOT LOGGED IN")
-        self.user_label.setFont(QFont("Courier New", 12, QFont.Bold))
-        
-        current_time = QLabel()
-        current_time.setFont(QFont("Courier New", 12, QFont.Bold))
-        self.time_label = current_time
-        
-        # Update time every second
-        self.time_timer = QTimer(self)
-        self.time_timer.timeout.connect(self.update_time)
-        self.time_timer.start(1000)
-        self.update_time()
-        
-        header.addWidget(self.user_label)
+        self.operator_label = QLabel(f"OPERATOR: {self.user_name} | CLEARANCE: {self.user_profile}")
+        self.operator_label.setFont(QFont("Courier New", 11, QFont.Bold))
+        self.operator_label.setStyleSheet("color: #00ff66;")
+
+        self.defcon_label = QLabel("DEFCON: 5 [ALL CLEAR]")
+        self.defcon_label.setFont(QFont("Courier New", 12, QFont.Bold))
+        self.defcon_label.setStyleSheet("color: #00ff66; padding: 2px 8px; border: 1px solid #00ff66;")
+
+        self.time_label = QLabel()
+        self.time_label.setFont(QFont("Courier New", 11, QFont.Bold))
+
+        header.addWidget(self.operator_label)
         header.addStretch()
-        header.addWidget(current_time)
-        main_layout.addLayout(header)
-        
-        # Main content area with grid layout
-        content = QGridLayout()
-        content.setSpacing(15)
-        
-        # Video feed panel
-        video_panel = DashboardPanel("LIVE VIDEO FEED")
+        header.addWidget(self.defcon_label)
+        header.addSpacing(20)
+        header.addWidget(self.time_label)
+        main_vbox.addLayout(header)
+
+        # Content Split Layout
+        grid = QGridLayout()
+        grid.setSpacing(10)
+
+        # Left Column: Video Feed & Targeting Reticle
+        video_panel = DashboardPanel("TACTICAL OPTRONIC SENSOR (LIVE FEED)")
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(640, 480)
-        self.video_label.setStyleSheet("border: 1px solid #ffffff;")
+        self.video_label.setStyleSheet("border: 1px solid #1f3a1f; background-color: #000000;")
         video_panel.layout.addWidget(self.video_label)
-        content.addWidget(video_panel, 0, 0, 2, 1)
-        
-        # Right side panels
-        right_panel = QVBoxLayout()
-        
-        # Object detection panel
-        detection_panel = DashboardPanel("OBJECT DETECTION")
-        detection_layout = QVBoxLayout()
-        
-        self.object_info = QLabel("STATUS: AWAITING DETECTION")
-        self.object_info.setFont(QFont("Courier New", 12, QFont.Bold))
-        
-        self.detection_status = QLabel("NO OBJECTS DETECTED")
-        self.detection_status.setFont(QFont("Courier New", 10))
-        
-        self.first_detection_time = QLabel("FIRST DETECTION: NONE")
-        self.first_detection_time.setFont(QFont("Courier New", 10))
-        
-        self.detection_image = QLabel("DETECTED OBJECT PREVIEW")
-        self.detection_image.setAlignment(Qt.AlignCenter)
-        self.detection_image.setMinimumSize(200, 200)
-        self.detection_image.setStyleSheet("border: 1px solid #ffffff; background-color: #000000;")
-        
-        self.classification_result = QLabel("CLASSIFICATION: NONE")
-        self.classification_result.setFont(QFont("Courier New", 12, QFont.Bold))
-        
-        self.classification_progress = QProgressBar()
-        self.classification_progress.setRange(0, 100)
-        self.classification_progress.setValue(0)
-        self.classification_progress.setTextVisible(True)
-        self.classification_progress.setStyleSheet("""
+        grid.addWidget(video_panel, 0, 0, 2, 1)
+
+        # Middle Column: Detection & Classification
+        mid_layout = QVBoxLayout()
+
+        det_panel = DashboardPanel("AI TARGET CLASSIFICATION")
+        self.det_status_label = QLabel("STATUS: SCANNING AIRSPACE")
+        self.det_status_label.setFont(QFont("Courier New", 11, QFont.Bold))
+
+        self.first_det_label = QLabel("FIRST CONTACT: NONE")
+        self.first_det_label.setFont(QFont("Courier New", 9))
+
+        self.det_preview = QLabel("NO ACTIVE TARGET LOCK")
+        self.det_preview.setAlignment(Qt.AlignCenter)
+        self.det_preview.setFixedSize(160, 160)
+        self.det_preview.setStyleSheet("border: 1px solid #00aa44; background-color: #000000;")
+
+        self.cls_result_label = QLabel("CLASSIFICATION: STANDBY")
+        self.cls_result_label.setFont(QFont("Courier New", 11, QFont.Bold))
+
+        self.threat_score_bar = QProgressBar()
+        self.threat_score_bar.setRange(0, 100)
+        self.threat_score_bar.setValue(0)
+        self.threat_score_bar.setTextVisible(True)
+        self.threat_score_bar.setFormat("THREAT SEVERITY: %v/100")
+        self.threat_score_bar.setStyleSheet("""
             QProgressBar {
-                border: 1px solid #ffffff;
+                border: 1px solid #00aa44;
                 text-align: center;
-                background-color: #000000;
+                background-color: #001100;
                 color: #ffffff;
+                font-weight: bold;
             }
             QProgressBar::chunk {
-                background-color: #ffffff;
+                background-color: #cc0000;
             }
         """)
-        
-        detection_layout.addWidget(self.object_info)
-        detection_layout.addWidget(self.detection_status)
-        detection_layout.addWidget(self.first_detection_time)
-        detection_layout.addWidget(self.detection_image)
-        detection_layout.addWidget(self.classification_result)
-        detection_layout.addWidget(self.classification_progress)
-        detection_panel.layout.addLayout(detection_layout)
-        right_panel.addWidget(detection_panel)
-        
-        # Location panel with Google Maps
-        location_panel = DashboardPanel("CURRENT LOCATION")
-        location_layout = QVBoxLayout()
-        
-        # Coordinates display
-        self.coord_label = QLabel("COORDINATES: 37.7749° N, 122.4194° W")
-        self.coord_label.setFont(QFont("Courier New", 10, QFont.Bold))
-        location_layout.addWidget(self.coord_label)
-        
-        # Satellite map view
-        self.map_view = SatelliteMapWidget()
-        location_layout.addWidget(self.map_view)
-        
-        location_panel.layout.addLayout(location_layout)
-        right_panel.addWidget(location_panel)
-        
-        content.addLayout(right_panel, 0, 1, 2, 1)
-        main_layout.addLayout(content)
-        
-        # Metrics panel (real-time)
-        metrics_panel = DashboardPanel("SYSTEM METRICS")
-        metrics_layout = QGridLayout()
-        metrics_panel.layout.addLayout(metrics_layout)
 
-        self.cpu_label = QLabel("CPU: 0%")
-        self.mem_label = QLabel("MEM: 0%")
-        self.gpu_label = QLabel("GPU: 0%")
-        self.fps_label = QLabel("FPS: 0.0")
-        self.latency_label = QLabel("LATENCY: 0 ms")
-        self.det_rate_label = QLabel("DETECTION RATE: 0.0 fps")
-        self.threats_label = QLabel("THREATS: 0")
+        det_panel.layout.addWidget(self.det_status_label)
+        det_panel.layout.addWidget(self.first_det_label)
+        det_panel.layout.addWidget(self.det_preview)
+        det_panel.layout.addWidget(self.cls_result_label)
+        det_panel.layout.addWidget(self.threat_score_bar)
+        mid_layout.addWidget(det_panel)
 
-        for lab in [self.cpu_label, self.mem_label, self.gpu_label, self.fps_label, self.latency_label, self.det_rate_label, self.threats_label]:
-            lab.setFont(QFont("Courier New", 10, QFont.Bold))
+        # Countermeasure Action Center
+        ecm_panel = DashboardPanel("ELECTRONIC COUNTERMEASURES (ECM)")
+        ecm_grid = QGridLayout()
 
-        metrics_layout.addWidget(self.cpu_label, 0, 0)
-        metrics_layout.addWidget(self.mem_label, 0, 1)
-        metrics_layout.addWidget(self.gpu_label, 0, 2)
-        metrics_layout.addWidget(self.fps_label, 1, 0)
-        metrics_layout.addWidget(self.latency_label, 1, 1)
-        metrics_layout.addWidget(self.det_rate_label, 1, 2)
-        metrics_layout.addWidget(self.threats_label, 2, 0)
+        self.btn_rf_jam = QPushButton("ENGAGE RF JAMMER (2.4/5.8G)")
+        self.btn_rf_jam.clicked.connect(self.trigger_rf_jam)
+        self.btn_rf_jam.setStyleSheet("background-color: #2b1100; color: #ffaa00; border: 1px solid #ffaa00;")
 
-        right_panel.addWidget(metrics_panel)
+        self.btn_gps_spoof = QPushButton("ACTIVATE GNSS SPOOFING")
+        self.btn_gps_spoof.clicked.connect(self.trigger_gps_spoof)
+        self.btn_gps_spoof.setStyleSheet("background-color: #001a2b; color: #00bbff; border: 1px solid #00bbff;")
 
-        # Status bar
-        status_bar = QHBoxLayout()
-        self.status_label = QLabel("SYSTEM STATUS: ONLINE | LAST UPDATE: " + 
-                             datetime.datetime.now().strftime("%H:%M:%S"))
-        self.status_label.setFont(QFont("Courier New", 10))
-        status_bar.addWidget(self.status_label)
-        main_layout.addLayout(status_bar)
-        
-        # Add pages to stacked widget
+        self.btn_kinetic = QPushButton("LAUNCH INTERCEPTOR DRONE")
+        self.btn_kinetic.clicked.connect(self.trigger_kinetic)
+        self.btn_kinetic.setStyleSheet("background-color: #330000; color: #ff3333; border: 1px solid #ff3333;")
+
+        self.btn_standby = QPushButton("ALL STANDBY / DISENGAGE")
+        self.btn_standby.clicked.connect(self.disengage_countermeasures)
+
+        ecm_grid.addWidget(self.btn_rf_jam, 0, 0)
+        ecm_grid.addWidget(self.btn_gps_spoof, 0, 1)
+        ecm_grid.addWidget(self.btn_kinetic, 1, 0)
+        ecm_grid.addWidget(self.btn_standby, 1, 1)
+        ecm_panel.layout.addLayout(ecm_grid)
+
+        self.ecm_status_label = QLabel("EFFECTORS: ALL SYSTEMS IN STANDBY")
+        self.ecm_status_label.setFont(QFont("Courier New", 9))
+        ecm_panel.layout.addWidget(self.ecm_status_label)
+        mid_layout.addWidget(ecm_panel)
+
+        grid.addLayout(mid_layout, 0, 1)
+
+        # Right Column: Radar Scope & Geospatial Map
+        right_layout = QVBoxLayout()
+
+        radar_panel = DashboardPanel("3D PULSE-DOPPLER RADAR")
+        self.radar_widget = RadarScopeWidget()
+        radar_panel.layout.addWidget(self.radar_widget)
+        right_layout.addWidget(radar_panel)
+
+        map_panel = DashboardPanel("GEOSPATIAL PERIMETER DEFENSE")
+        self.coord_label = QLabel("BASE COORD: 37.7749° N, 122.4194° W")
+        self.coord_label.setFont(QFont("Courier New", 9, QFont.Bold))
+        map_panel.layout.addWidget(self.coord_label)
+
+        self.map_widget = SatelliteMapWidget()
+        map_panel.layout.addWidget(self.map_widget)
+        right_layout.addWidget(map_panel)
+
+        grid.addLayout(right_layout, 0, 2)
+        main_vbox.addLayout(grid)
+
+        # Bottom System Metrics Bar
+        metrics_panel = DashboardPanel("SYSTEM TELEMETRY & MULTI-SENSOR STATUS")
+        metrics_h = QHBoxLayout()
+
+        self.lbl_cpu = QLabel("CPU: 0%")
+        self.lbl_mem = QLabel("MEM: 0%")
+        self.lbl_gpu = QLabel("GPU: RTX 3050")
+        self.lbl_fps = QLabel("FPS: 0.0")
+        self.lbl_lat = QLabel("LATENCY: 0 ms")
+        self.lbl_rf = QLabel("RF SENSOR: SCANNING 2.4/5.8G")
+        self.lbl_threats = QLabel("ACTIVE TARGETS: 0")
+
+        for lab in [self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_fps, self.lbl_lat, self.lbl_rf, self.lbl_threats]:
+            lab.setFont(QFont("Courier New", 9, QFont.Bold))
+            metrics_h.addWidget(lab)
+
+        metrics_panel.layout.addLayout(metrics_h)
+        main_vbox.addWidget(metrics_panel)
+
+        # Add pages
         self.stacked_widget.addWidget(self.login_page)
         self.stacked_widget.addWidget(self.main_page)
-        
-        # Start with login page
-        self.stacked_widget.setCurrentIndex(0)
-        
         self.main_container.addWidget(self.stacked_widget)
-        
-        # Initialize video capture and timer
-        self.cap = None
-        self.frame_timer = QTimer()
-        self.frame_timer.timeout.connect(self.update_frame)
-        
-        # Load object detection model (prefer CUDA)
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA GPU is required for UI inference")
-        self.torch_device = torch.device('cuda')
-        try:
-            if torch.cuda.is_available():
-                torch.backends.cudnn.benchmark = True
-        except Exception:
-            pass
-        self.model = fasterrcnn_resnet50_fpn(pretrained=True)
-        self.model.to(self.torch_device)
-        self.model.eval()
-        
-        self.transform = transforms.Compose([
-            transforms.ToTensor()
-        ])
-        
-        # First detection flag and image
-        self.first_detection = False
-        self.first_detection_image = None
-        
-        # Classification progress simulation
-        self.classification_timer = QTimer()
-        self.classification_timer.timeout.connect(self.update_classification_progress)
-        self.classification_progress_value = 0
-        self.classifying = False
-        
-        # Drone classifier from Program 2
-        self.drone_classifier = DroneClassifier().to(self.torch_device)
-        self.drone_classifier.eval()
 
-        # Performance metrics state
-        self._frame_times = deque(maxlen=60)
-        self._det_times = deque(maxlen=300)
-        self._threat_count = 0
-        self._last_fps = 0.0
-        self._last_latency_ms = 0
-        self._last_det_rate = 0.0
-        self._alert_blink_state = False
-        self._metrics_timer = QTimer(self)
-        self._metrics_timer.timeout.connect(self.update_metrics)
-        self._metrics_timer.start(1000)
-        # NVML init (best-effort)
-        self._nvml_handle = None
-        try:
-            if nvml is not None:
-                nvml.nvmlInit()
-                self._nvml_handle = nvml.nvmlDeviceGetHandleByIndex(0)
-        except Exception:
-            self._nvml_handle = None
+        # Frame Processing Timer
+        self.frame_timer = QTimer(self)
+        self.frame_timer.timeout.connect(self.process_frame)
+
+        # Time & Metrics Timer
+        self.clock_timer = QTimer(self)
+        self.clock_timer.timeout.connect(self.update_telemetry)
+        self.clock_timer.start(1000)
+
+        # Start with login screen
+        self.stacked_widget.setCurrentIndex(0)
 
     def show_login_dialog(self):
-        dialog = LoginDialog(self)
-        if dialog.exec_():
-            self.user_name = dialog.name_input.text()
-            self.user_profile = dialog.profile_input.text()
-            if not self.user_name:
-                self.user_name = "ANONYMOUS"
-            if not self.user_profile:
-                self.user_profile = "STANDARD"
-                
-            self.user_label.setText(f"OPERATOR: {self.user_name} | PROFILE: {self.user_profile}")
-            self.stacked_widget.setCurrentIndex(1)  # Switch to main page
-            
-            # Simulate getting current location
-            # In a real app, you would use geolocation services
-            self.update_location()
-    
-    def update_location(self):
-        # Simulate random location near default coordinates
-        lat = 37.7749 + (random.random() - 0.5) * 0.01
-        lng = -122.4194 + (random.random() - 0.5) * 0.01
-        
-        self.coord_label.setText(f"COORDINATES: {lat:.4f}° N, {lng:.4f}° W")
-        self.map_view.set_coordinates(lat, lng)
-    
-    def update_time(self):
-        current_time = datetime.datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-        self.time_label.setText(current_time)
-        self.status_label.setText(f"SYSTEM STATUS: ONLINE | LAST UPDATE: {datetime.datetime.now().strftime('%H:%M:%S')}")
-        
-        # Update location occasionally (every 10 seconds)
-        if datetime.datetime.now().second % 10 == 0:
-            self.update_location()
+        dlg = LoginDialog(self)
+        if dlg.exec_():
+            if dlg.name_input.text():
+                self.user_name = dlg.name_input.text()
+            if dlg.profile_input.text():
+                self.user_profile = dlg.profile_input.text()
+            self.operator_label.setText(f"OPERATOR: {self.user_name} | CLEARANCE: {self.user_profile}")
+            self.countermeasure_ctrl.set_operator(self.user_name)
+            self.stacked_widget.setCurrentIndex(1)
+            # Auto-start simulation by default so operator sees live defense action immediately
+            self.start_simulation()
 
-    def compute_fps(self):
-        if len(self._frame_times) < 2:
-            return 0.0
-        dt = self._frame_times[-1] - self._frame_times[0]
-        if dt <= 0:
-            return 0.0
-        return (len(self._frame_times) - 1) / dt
+    def load_video(self):
+        video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File", "", "Video Files (*.mp4 *.avi *.mkv)")
+        if video_path:
+            self.is_simulation_mode = False
+            self.synthetic_gen = None
+            if self.cap:
+                self.cap.release()
+            self.cap = cv2.VideoCapture(video_path)
+            self.frame_timer.start(33)
+            logger.info(f"Opened video file: {video_path}")
 
-    def compute_detection_rate(self, detections_in_frame):
-        # prune old timestamps (older than 5s)
-        now = time.time()
-        while self._det_times and now - self._det_times[0] > 5.0:
-            self._det_times.popleft()
-        # instantaneous update happens in update_frame; here we just return avg
-        if not self._det_times:
-            return 0.0
-        interval = max(now - self._det_times[0], 1e-3)
-        return len(self._det_times) / interval
+    def open_camera(self):
+        self.is_simulation_mode = False
+        self.synthetic_gen = None
+        if self.cap:
+            self.cap.release()
+        self.cap = cv2.VideoCapture(0)
+        self.frame_timer.start(33)
+        logger.info("Opened live camera index 0.")
 
-    def update_metrics(self):
+    def start_simulation(self):
+        self.is_simulation_mode = True
+        self.synthetic_gen = SyntheticDroneGenerator(width=640, height=480)
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        self.frame_timer.start(33)
+        logger.info("Tactical flight simulation initialized.")
+
+    def process_frame(self):
+        t0 = time.time()
+        frame = None
+
+        if self.is_simulation_mode and self.synthetic_gen:
+            frame = self.synthetic_gen.generate_frame()
+        elif self.cap and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if not ret:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                return
+
+        if frame is None:
+            return
+
+        h, w = frame.shape[:2]
+
+        # 1. Optical Detection
+        tracks = self.detector.detect(frame)
+
+        # 2. Multi-Sensor Simulation (RF & Radar)
+        radar_contacts = []
+        rf_emissions = []
+        radar_ui_contacts = []
+
+        if tracks:
+            primary_track = tracks[0]
+            cx, cy = primary_track.center
+
+            # Estimate simulated distance and bearing from pixel coordinates
+            dist_m = max(200.0, 3200.0 - (cy * 4.5))
+            bearing_deg = (45.0 + (cx / w) * 90.0) % 360.0
+
+            rf_emissions = self.rf_sensor.scan_spectrum(simulated_target_bearing=bearing_deg, distance_m=dist_m)
+            radar_contacts = self.radar_sensor.scan_for_contacts(target_range_m=dist_m, target_azimuth_deg=bearing_deg)
+
+            # 3. Trajectory Prediction
+            traj = self.trajectory_predictor.update_track(primary_track.target_id, cx, cy)
+            history_pts = self.trajectory_predictor.get_history(primary_track.target_id)
+
+            # 4. Deep Drone Classification
+            if primary_track.crop is not None and primary_track.crop.size > 0:
+                cls_result = self.classifier.classify_crop(primary_track.crop)
+                self._current_classification = cls_result
+            else:
+                cls_result = self._current_classification
+
+            # 5. Threat Evaluation
+            drone_lat = 37.7749 + (cy - h // 2) * 0.00004
+            drone_lon = -122.4194 + (cx - w // 2) * 0.00004
+            threat_eval = self.threat_engine.evaluate_target(
+                target_id=primary_track.target_id,
+                target_lat=drone_lat,
+                target_lon=drone_lon,
+                classification=cls_result,
+                trajectory=traj
+            )
+            self._current_threat = threat_eval
+            self.threat_mgr.update_threat(threat_eval)
+
+            # Update Map & Radar UI
+            self.map_widget.set_coordinates(37.7749, -122.4194, drone_lat, drone_lon, threat_eval.geofence_zone)
+            radar_ui_contacts.append((bearing_deg, dist_m / 3500.0, threat_eval.threat_level))
+
+            # Render Military Target Reticle & Trajectory onto Frame
+            draw_corner_brackets(frame, primary_track.bbox, (0, 0, 255) if threat_eval.geofence_zone == "RED" else (0, 255, 0))
+            draw_targeting_reticle(frame, (cx, cy), radius=28, threat_level=threat_eval.threat_level)
+            draw_trajectory_path(frame, history_pts, traj.predicted_path)
+
+            # Update Right Dashboard Info
+            self.det_status_label.setText(f"TARGET #{primary_track.target_id}: LOCKED [{threat_eval.geofence_zone} ZONE]")
+            self.first_det_label.setText(f"RANGE: {threat_eval.distance_to_base_m:.0f}m | BEARING: {threat_eval.bearing_from_base_deg:.1f}°")
+
+            if cls_result:
+                self.cls_result_label.setText(f"TYPE: {cls_result.predicted_class}\nCONF: {cls_result.confidence*100:.1f}%")
+                self.threat_score_bar.setValue(int(threat_eval.numerical_threat_score))
+
+            # Crop Preview
+            if primary_track.crop is not None and primary_track.crop.size > 0:
+                cr_rgb = cv2.cvtColor(cv2.resize(primary_track.crop, (160, 160)), cv2.COLOR_BGR2RGB)
+                qimg_crop = QImage(cr_rgb.data, 160, 160, cr_rgb.strides[0], QImage.Format_RGB888)
+                self.det_preview.setPixmap(QPixmap.fromImage(qimg_crop))
+
+            # Auto-DEFCON update
+            if threat_eval.threat_level == "CRITICAL":
+                self.defcon_label.setText("DEFCON: 1 [CRITICAL ENGAGEMENT]")
+                self.defcon_label.setStyleSheet("color: #ff0000; border: 1px solid #ff0000; font-weight: bold;")
+            elif threat_eval.threat_level == "HIGH":
+                self.defcon_label.setText("DEFCON: 2 [WARNING BREACH]")
+                self.defcon_label.setStyleSheet("color: #ffaa00; border: 1px solid #ffaa00; font-weight: bold;")
+            else:
+                self.defcon_label.setText("DEFCON: 4 [ACTIVE TRACK]")
+                self.defcon_label.setStyleSheet("color: #00ff66; border: 1px solid #00ff66;")
+
+            # RF Telemetry update
+            if rf_emissions:
+                rf = rf_emissions[0]
+                self.lbl_rf.setText(f"RF: {rf.protocol} [{rf.frequency_mhz:.0f}MHz, {rf.rssi_dbm:.0f}dBm]")
+
+        else:
+            self.det_status_label.setText("STATUS: SCANNING AIRSPACE")
+            self.threat_score_bar.setValue(0)
+            self.defcon_label.setText("DEFCON: 5 [ALL CLEAR]")
+            self.defcon_label.setStyleSheet("color: #00ff66; border: 1px solid #00ff66;")
+
+        self.radar_widget.set_contacts(radar_ui_contacts)
+
+        # Measure timing
+        dt = time.time() - t0
+        self._frame_times.append(time.time())
+        if len(self._frame_times) >= 2:
+            self._last_fps = (len(self._frame_times) - 1) / (self._frame_times[-1] - self._frame_times[0])
+        self._last_latency = int(dt * 1000)
+
+        # Overlay corner brackets & HUD onto video feed
+        cv2.putText(frame, f"FPS: {self._last_fps:.1f} | LAT: {self._last_latency}ms", (12, h - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 60), 1)
+
+        # Convert frame to QImage and display
+        rgb_frame = cv2.cvtColor(cv2.resize(frame, (640, 480)), cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb_frame.data, 640, 480, rgb_frame.strides[0], QImage.Format_RGB888)
+        self.video_label.setPixmap(QPixmap.fromImage(qimg))
+
+    def trigger_rf_jam(self):
+        target_id = self._current_threat.target_id if self._current_threat else 1
+        res = self.countermeasure_ctrl.activate_rf_jammer(target_id)
+        self.ecm_status_label.setText(f"EFFECTORS: RF JAMMER ACTIVE (TARGET #{target_id})")
+        self.audit_logger.log_event("RF_JAMMER_ENGAGED", {"target_id": target_id}, operator=self.user_name)
+        QMessageBox.information(self, "COUNTERMEASURE ENGAGED", f"Directional RF Jammer Activated on Target #{target_id}!\nCommand link disruption active.")
+
+    def trigger_gps_spoof(self):
+        target_id = self._current_threat.target_id if self._current_threat else 1
+        res = self.countermeasure_ctrl.activate_gps_spoofing(target_id)
+        self.ecm_status_label.setText(f"EFFECTORS: GNSS SPOOFER ACTIVE (TARGET #{target_id})")
+        self.audit_logger.log_event("GPS_SPOOFING_ENGAGED", {"target_id": target_id}, operator=self.user_name)
+        QMessageBox.information(self, "COUNTERMEASURE ENGAGED", f"GNSS Spoofing Active on Target #{target_id}!\nTransmitting simulated forced-return coordinates.")
+
+    def trigger_kinetic(self):
+        target_id = self._current_threat.target_id if self._current_threat else 1
+        res = self.countermeasure_ctrl.launch_kinetic_interceptor(target_id)
+        self.ecm_status_label.setText(f"EFFECTORS: INTERCEPTOR DISPATCHED (TARGET #{target_id})")
+        self.audit_logger.log_event("KINETIC_LAUNCH", {"target_id": target_id}, operator=self.user_name)
+        QMessageBox.warning(self, "KINETIC LAUNCH AUTHORIZED", f"Interceptor Drone Dispatched from Silo Alpha against Target #{target_id}!")
+
+    def disengage_countermeasures(self):
+        self.countermeasure_ctrl.disengage_all()
+        self.ecm_status_label.setText("EFFECTORS: ALL SYSTEMS IN STANDBY")
+        self.audit_logger.log_event("EFFECTORS_DISENGAGED", {}, operator=self.user_name)
+
+    def update_telemetry(self):
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.time_label.setText(now)
+
         try:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
-            gpu = 0
-            try:
-                if self._nvml_handle is not None:
-                    util = nvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
-                    gpu = int(util.gpu)
-            except Exception:
-                gpu = 0
-            self.cpu_label.setText(f"CPU: {int(cpu)}%")
-            self.mem_label.setText(f"MEM: {int(mem)}%")
-            self.gpu_label.setText(f"GPU: {int(gpu)}%")
-            self.fps_label.setText(f"FPS: {self._last_fps:.1f}")
-            self.latency_label.setText(f"LATENCY: {self._last_latency_ms} ms")
-            self.det_rate_label.setText(f"DETECTION RATE: {self._last_det_rate:.1f} fps")
-            # Blink threats label if nonzero
-            if self._threat_count > 0:
-                self._alert_blink_state = not self._alert_blink_state
-                color = '#ff0000' if self._alert_blink_state else '#ffffff'
-                self.threats_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-            self.threats_label.setText(f"THREATS: {self._threat_count}")
+            self.lbl_cpu.setText(f"CPU: {int(cpu)}%")
+            self.lbl_mem.setText(f"MEM: {int(mem)}%")
+            self.lbl_fps.setText(f"FPS: {self._last_fps:.1f}")
+            self.lbl_lat.setText(f"LATENCY: {self._last_latency} ms")
+            summary = self.threat_mgr.get_summary()
+            self.lbl_threats.setText(f"ACTIVE TARGETS: {summary['active_threat_count']}")
         except Exception:
             pass
-    
-    def load_video(self):
-        video_path, _ = QFileDialog.getOpenFileName(self, "Open Video")
-        if video_path:
-            self.cap = cv2.VideoCapture(video_path)
-            self.frame_timer.start(30)
-            self.reset_detection()
 
-    def open_camera(self):
-        self.cap = cv2.VideoCapture(0)
-        self.frame_timer.start(30)
-        self.reset_detection()
-        
-    def reset_detection(self):
-        self.first_detection = False
-        self.first_detection_image = None
-        self.object_info.setText("STATUS: AWAITING DETECTION")
-        self.detection_status.setText("NO OBJECTS DETECTED")
-        self.first_detection_time.setText("FIRST DETECTION: NONE")
-        self.classification_result.setText("CLASSIFICATION: NONE")
-        self.classification_progress.setValue(0)
-        self.classification_progress_value = 0
-        self.classifying = False
-        self.drone_details_shown = False  # Track if we've shown the details dialog
-        
-    def update_classification_progress(self):
-        if self.classification_progress_value < 100:
-            self.classification_progress_value += 5
-            self.classification_progress.setValue(self.classification_progress_value)
-            if self.classification_progress_value < 50:
-                self.classification_result.setText("CLASSIFICATION: THE SYSTEM IS DETECTING...")
-            elif self.classification_progress_value < 80:
-                self.classification_result.setText("CLASSIFICATION: ANALYZING FEATURES...")
-        else:
-            self.classification_timer.stop()
-            self.classifying = False
-            
-            # Use the drone classifier to classify the detected object
-            if self.first_detection_image is not None:
-                # Convert the OpenCV image to PIL format for classification
-                pil_image = Image.fromarray(cv2.cvtColor(self.first_detection_image, cv2.COLOR_BGR2RGB))
-                
-                # Classify using a random selection for demonstration
-                # In a real application, you would use the actual classifier here
-                classes = ['SURVEILLANCE DRONE', 'SUICIDE DRONE', 'CIVILIAN DRONE', 'CUSTOMIZED DRONE', 'OTHER']
-                result = random.choice(classes)
-                
-                self.classification_result.setText(f"CLASSIFICATION: {result}")
-                
-                # Set color based on classification
-                if result == "SURVEILLANCE DRONE" or result == "SUICIDE DRONE":
-                    self.classification_result.setStyleSheet("color: #ff0000; font-weight: bold;")
-                    self._threat_count = min(self._threat_count + 1, 99)
-                else:
-                    self.classification_result.setStyleSheet("color: #ffffff; font-weight: bold;")
-                    
-                # If classified as OTHER, show the details dialog
-                if result == "OTHER" and not hasattr(self, 'drone_details_shown') or not self.drone_details_shown:
-                    self.drone_details_shown = True
-                    # Use QTimer to show dialog after a short delay
-                    QTimer.singleShot(500, self.show_drone_details_dialog)
-    
-    def show_drone_details_dialog(self):
-        dialog = DroneDetailsDialog(self)
-        dialog.exec_()
+    def closeEvent(self, event):
+        if self.cap:
+            self.cap.release()
+        self.frame_timer.stop()
+        self.clock_timer.stop()
+        event.accept()
 
-    def update_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            self.frame_timer.stop()
-            return
 
-        # Convert frame to RGB for PyTorch model
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        input_tensor = self.transform(rgb_frame).to(self.torch_device)
-        
-        # Update time on each frame
-        current_time = datetime.datetime.now()
-        self.time_label.setText(current_time.strftime("%d-%m-%Y %H:%M:%S"))
-        
-        start_t = time.time()
-        # Object detection
-        with torch.no_grad():
-            predictions = self.model([input_tensor])[0]
-
-        # Check for detections with high confidence
-        detection_found = False
-        det_this_frame = 0
-        for idx, score in enumerate(predictions['scores']):
-            if score > 0.7:  # Lower threshold for better detection
-                detection_found = True
-                box = predictions['boxes'][idx].numpy().astype(int)
-                label = predictions['labels'][idx].item()
-                
-                # Draw bounding box with military-style targeting
-                cv2.rectangle(frame, tuple(box[:2]), tuple(box[2:]), (0, 255, 0), 2)
-                
-                # Add targeting elements
-                center_x = (box[0] + box[2]) // 2
-                center_y = (box[1] + box[3]) // 2
-                
-                # Crosshair
-                cv2.line(frame, (center_x - 20, center_y), (center_x + 20, center_y), (0, 255, 0), 1)
-                cv2.line(frame, (center_x, center_y - 20), (center_x, center_y + 20), (0, 255, 0), 1)
-                
-                # Corner brackets
-                bracket_len = 15
-                # Top-left
-                cv2.line(frame, (box[0], box[1]), (box[0] + bracket_len, box[1]), (0, 255, 0), 2)
-                cv2.line(frame, (box[0], box[1]), (box[0], box[1] + bracket_len), (0, 255, 0), 2)
-                # Top-right
-                cv2.line(frame, (box[2], box[1]), (box[2] - bracket_len, box[1]), (0, 255, 0), 2)
-                cv2.line(frame, (box[2], box[1]), (box[2], box[1] + bracket_len), (0, 255, 0), 2)
-                # Bottom-left
-                cv2.line(frame, (box[0], box[3]), (box[0] + bracket_len, box[3]), (0, 255, 0), 2)
-                cv2.line(frame, (box[0], box[3]), (box[0], box[3] - bracket_len), (0, 255, 0), 2)
-                # Bottom-right
-                cv2.line(frame, (box[2], box[3]), (box[2] - bracket_len, box[3]), (0, 255, 0), 2)
-                cv2.line(frame, (box[2], box[3]), (box[2], box[3] - bracket_len), (0, 255, 0), 2)
-                
-                # Extract the cropped object
-                if box[1] < box[3] and box[0] < box[2]:  # Ensure valid box dimensions
-                    cropped = frame[box[1]:box[3], box[0]:box[2]]
-                    
-                    if cropped.size > 0:  # Ensure cropped image is not empty
-                        # Handle first detection
-                        if not self.first_detection:
-                            self.first_detection = True
-                            self.first_detection_time.setText(f"FIRST DETECTION: {current_time.strftime('%H:%M:%S')}")
-                            self.object_info.setText("STATUS: OBJECT DETECTED FOR THE FIRST TIME!")
-                            self.object_info.setStyleSheet("color: #ff0000; font-weight: bold;")
-                            
-                            # Save and display the first detection image
-                            self.first_detection_image = cropped.copy()
-                            cropped_resized = cv2.resize(cropped, (200, 200))
-                            cropped_qt = QImage(cropped_resized.data, cropped_resized.shape[1], 
-                                               cropped_resized.shape[0], cropped_resized.strides[0], 
-                                               QImage.Format_BGR888)
-                            self.detection_image.setPixmap(QPixmap.fromImage(cropped_qt))
-                            
-                            # Start classification process
-                            self.classifying = True
-                            self.classification_progress_value = 0
-                            self.classification_timer.start(100)
-                        else:
-                            self.detection_status.setText(f"OBJECT TRACKED AT {current_time.strftime('%H:%M:%S')}")
-                        det_this_frame += 1
-                break
-        
-        if not detection_found and not self.first_detection:
-            self.object_info.setText("STATUS: SCANNING FOR OBJECTS...")
-            self.object_info.setStyleSheet("color: #ffffff;")
-
-        # Add military-style HUD elements to frame
-        h, w = frame.shape[:2]
-        
-        # Add frame border
-        cv2.rectangle(frame, (0, 0), (w-1, h-1), (0, 255, 0), 1)
-        
-        # Add corner brackets to frame
-        bracket_size = 20
-        # Top-left
-        cv2.line(frame, (0, 0), (bracket_size, 0), (0, 255, 0), 2)
-        cv2.line(frame, (0, 0), (0, bracket_size), (0, 255, 0), 2)
-        # Top-right
-        cv2.line(frame, (w-1, 0), (w-1-bracket_size, 0), (0, 255, 0), 2)
-        cv2.line(frame, (w-1, 0), (w-1, bracket_size), (0, 255, 0), 2)
-        # Bottom-left
-        cv2.line(frame, (0, h-1), (bracket_size, h-1), (0, 255, 0), 2)
-        cv2.line(frame, (0, h-1), (0, h-1-bracket_size), (0, 255, 0), 2)
-        # Bottom-right
-        cv2.line(frame, (w-1, h-1), (w-1-bracket_size, h-1), (0, 255, 0), 2)
-        cv2.line(frame, (w-1, h-1), (w-1, h-1-bracket_size), (0, 255, 0), 2)
-        
-        # Add timestamp to frame
-        timestamp = current_time.strftime("%H:%M:%S")
-        cv2.putText(frame, timestamp, (w-120, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        
-        # Overlay HUD metrics
-        det_rate = self.compute_detection_rate(det_this_frame)
-        fps = self.compute_fps()
-        latency_ms = int((time.time() - start_t) * 1000)
-        self._last_fps = fps
-        self._last_latency_ms = latency_ms
-        self._last_det_rate = det_rate
-        hud_text = f"FPS:{fps:.1f}  LAT:{latency_ms}ms  DET:{det_rate:.1f}/s"
-        cv2.putText(frame, hud_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-        # Resize and display the main frame
-        frame = cv2.resize(frame, (640, 480))
-        img = QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QImage.Format_BGR888)
-        self.video_label.setPixmap(QPixmap.fromImage(img))
-
-        # Record timing for FPS
-        self._frame_times.append(time.time())
-
-        # Mark detections for rate
-        if det_this_frame > 0:
-            now = time.time()
-            for _ in range(det_this_frame):
-                self._det_times.append(now)
-
-if __name__ == '__main__':
+def main():
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')  # Use Fusion style for better dark theme support
+    app.setStyle("Fusion")
     window = DesktopApp()
     window.show()
     sys.exit(app.exec_())
 
 
-# Program 2: Drone Image Classifier
-
-import torch
-import torchvision.transforms as transforms
-from PIL import Image
-import torch.nn as nn
-import torchvision.models as models
-
-# Dummy classifier for simplicity
-class DroneClassifier(nn.Module):
-    def __init__(self):
-        super(DroneClassifier, self).__init__()
-        self.base_model = models.resnet18(pretrained=True)
-        self.base_model.fc = nn.Linear(self.base_model.fc.in_features, 5)
-
-    def forward(self, x):
-        return self.base_model(x)
-
-
-def classify_image(img_path):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = DroneClassifier().to(device)
-    model.eval()  # Assume model is pretrained for actual use
-
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-
-    img = Image.open(img_path).convert('RGB')
-    input_tensor = transform(img).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        outputs = model(input_tensor)
-        _, predicted = torch.max(outputs, 1)
-
-    classes = ['Surveillance Drone', 'Suicide Drone', 'Civilian Drone', 'Customized Drone', 'Other']
-    return classes[predicted.item()]
-
-# Example usage:
-# result = classify_image('drone_image.jpg')
-# print("Predicted class:", result)
+if __name__ == "__main__":
+    main()
